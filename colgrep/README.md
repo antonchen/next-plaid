@@ -595,17 +595,18 @@ Lookup order:
 
 ```bibtex
 @software{next-plaid,
-  title  = {NextPlaid, ColGREP: Multi-vector search, from database to coding agents.},
-  url    = {https://github.com/lightonai/next-plaid},
-  author = {Sourty, Raphaël},
-  year   = {2026},
+  title        = {NextPlaid, ColGREP: Multi-vector search, from database to coding agents.},
+  url          = {https://github.com/lightonai/next-plaid},
+  author       = {Sourty, Rapha\"{e}l},
+  contributors = {Dinaburg, Artem and Carron, Igor and Hsu, Chao-Chun (Joe) and Weitekamp, Raymond and R\k{a}czka, Szymon and Motliuk, Mark},
+  year         = {2026},
 }
 
 @misc{LateOn-Code,
-title  = {LateOn-Code: a Family of State-Of-The-Art Late Interaction Code Retrieval Models},
-author = {Chaffin, Antoine},
-url    = {https://huggingface.co/collections/lightonai/lateon-code},
-year   = {2026}
+  title  = {LateOn-Code: a Family of State-Of-The-Art Late Interaction Code Retrieval Models},
+  author = {Chaffin, Antoine},
+  url    = {https://huggingface.co/collections/lightonai/lateon-code},
+  year   = {2026}
 }
 ```
 
