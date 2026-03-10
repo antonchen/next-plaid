@@ -28,6 +28,10 @@ Semantic code search for your terminal and your coding agents. Searches combine 
 Install:
 
 ```bash
+# Homebrew (macOS / Linux)
+brew install lightonai/tap/colgrep
+
+# Shell installer
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lightonai/next-plaid/releases/latest/download/colgrep-installer.sh | sh
 ```
 
