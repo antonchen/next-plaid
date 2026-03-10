@@ -42,10 +42,6 @@ jobs:
           REPO="lightonai/next-plaid"
           TAG="${{ steps.tag.outputs.tag }}"
 
-          # Source tarball SHA
-          SOURCE_SHA=$(curl -sL "https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz" | sha256sum | awk '{print $1}')
-          echo "source=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
-
           # Binary SHAs from release .sha256 files
           AARCH64_DARWIN_SHA=$(gh release download "${TAG}" --repo "${REPO}" -p "colgrep-aarch64-apple-darwin.tar.xz.sha256" -O - | awk '{print $1}')
           X86_64_DARWIN_SHA=$(gh release download "${TAG}" --repo "${REPO}" -p "colgrep-x86_64-apple-darwin.tar.xz.sha256" -O - | awk '{print $1}')
@@ -64,91 +60,43 @@ jobs:
       - name: Generate formula
         env:
           VERSION: ${{ steps.tag.outputs.version }}
-          SOURCE_SHA: ${{ steps.shas.outputs.source }}
           AARCH64_DARWIN_SHA: ${{ steps.shas.outputs.aarch64_darwin }}
           X86_64_DARWIN_SHA: ${{ steps.shas.outputs.x86_64_darwin }}
           X86_64_LINUX_SHA: ${{ steps.shas.outputs.x86_64_linux }}
         run: |
+          REPO="lightonai/next-plaid"
           cat > Formula/colgrep.rb <<RUBY
           class Colgrep < Formula
             desc "Semantic code search powered by ColBERT"
-            homepage "https://github.com/lightonai/next-plaid"
+            homepage "https://github.com/${REPO}"
             version "${VERSION}"
             license "MIT"
 
-            url "https://github.com/lightonai/next-plaid/archive/refs/tags/v#{version}.tar.gz"
-            sha256 "${SOURCE_SHA}"
-
             on_macos do
               on_arm do
-                resource "binary" do
-                  url "https://github.com/lightonai/next-plaid/releases/download/v#{version}/colgrep-aarch64-apple-darwin.tar.xz"
-                  sha256 "${AARCH64_DARWIN_SHA}"
-                end
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/colgrep-aarch64-apple-darwin.tar.xz"
+                sha256 "${AARCH64_DARWIN_SHA}"
               end
 
               on_intel do
-                resource "binary" do
-                  url "https://github.com/lightonai/next-plaid/releases/download/v#{version}/colgrep-x86_64-apple-darwin.tar.xz"
-                  sha256 "${X86_64_DARWIN_SHA}"
-                end
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/colgrep-x86_64-apple-darwin.tar.xz"
+                sha256 "${X86_64_DARWIN_SHA}"
               end
             end
 
             on_linux do
               on_intel do
-                resource "binary" do
-                  url "https://github.com/lightonai/next-plaid/releases/download/v#{version}/colgrep-x86_64-unknown-linux-gnu.tar.xz"
-                  sha256 "${X86_64_LINUX_SHA}"
-                end
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/colgrep-x86_64-unknown-linux-gnu.tar.xz"
+                sha256 "${X86_64_LINUX_SHA}"
               end
             end
 
-            depends_on "rust" => :build
-
             def install
-              if resources.key?("binary")
-                binary_installed = install_prebuilt_binary
-                return if binary_installed
-              end
-
-              ohai "No prebuilt binary available, building from source..."
-              install_from_source
+              bin.install "colgrep"
             end
 
             test do
               assert_match version.to_s, shell_output("#{bin}/colgrep --version")
-            end
-
-            private
-
-            def install_prebuilt_binary
-              resource("binary").stage do
-                binary = Dir["*/colgrep"].first
-                if binary && File.exist?(binary)
-                  bin.install binary
-                  return true
-                end
-              end
-              false
-            rescue => e
-              opoo "Failed to install prebuilt binary (#{e.message}), falling back to source build"
-              false
-            end
-
-            def install_from_source
-              features = []
-
-              if OS.mac?
-                features << "accelerate"
-                features << "coreml" if Hardware::CPU.arm?
-              end
-
-              args = ["--release", "-p", "colgrep"]
-              args += ["--features", features.join(",")] unless features.empty?
-
-              system "cargo", "build", *args
-              bin.install "target/release/colgrep"
             end
           end
           RUBY
