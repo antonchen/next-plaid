@@ -70,10 +70,10 @@ use ort::execution_providers::CUDAExecutionProvider;
 use ort::execution_providers::CoreMLExecutionProvider;
 #[cfg(feature = "directml")]
 use ort::execution_providers::DirectMLExecutionProvider;
-#[cfg(feature = "tensorrt")]
-use ort::execution_providers::TensorRTExecutionProvider;
 #[cfg(feature = "migraphx")]
 use ort::execution_providers::MIGraphXExecutionProvider;
+#[cfg(feature = "tensorrt")]
+use ort::execution_providers::TensorRTExecutionProvider;
 
 use ort::session::builder::SessionBuilder;
 
@@ -255,7 +255,12 @@ pub fn is_cuda_available() -> bool {
 
 fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
     // Skip GPU providers entirely if CPU-only mode is forced
-    #[cfg(any(feature = "cuda", feature = "tensorrt", feature = "coreml", feature = "migraphx"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "tensorrt",
+        feature = "coreml",
+        feature = "migraphx"
+    ))]
     let force_cpu = is_force_cpu();
 
     #[cfg(feature = "cuda")]
