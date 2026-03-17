@@ -136,6 +136,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_recursion_depth: Option<usize>,
 
+    /// Show relative paths in search output (default: false = absolute paths)
+    /// When true, file paths are displayed relative to the current working directory
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_paths: Option<bool>,
+
     /// Extra directory/file patterns to ignore during indexing (on top of defaults)
     /// e.g., ["generated", "*.pb.go", "migrations"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -308,6 +313,22 @@ impl Config {
     /// Clear the verbose setting (revert to default: false)
     pub fn clear_verbose(&mut self) {
         self.verbose = None;
+    }
+
+    /// Check if relative paths should be used in search output
+    /// Defaults to false (absolute paths)
+    pub fn use_relative_paths(&self) -> bool {
+        self.relative_paths.unwrap_or(false)
+    }
+
+    /// Set relative paths mode
+    pub fn set_relative_paths(&mut self, relative: bool) {
+        self.relative_paths = Some(relative);
+    }
+
+    /// Clear the relative paths setting (revert to default: false)
+    pub fn clear_relative_paths(&mut self) {
+        self.relative_paths = None;
     }
 
     /// Get the max parser recursion depth.
@@ -682,5 +703,37 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.get_extra_ignore().is_empty());
         assert!(config.get_force_include().is_empty());
+    }
+
+    #[test]
+    fn test_relative_paths_default_false() {
+        let config = Config::default();
+        assert!(!config.use_relative_paths());
+    }
+
+    #[test]
+    fn test_relative_paths_set_clear() {
+        let mut config = Config::default();
+        config.set_relative_paths(true);
+        assert!(config.use_relative_paths());
+
+        config.clear_relative_paths();
+        assert!(!config.use_relative_paths());
+    }
+
+    #[test]
+    fn test_relative_paths_serialization() {
+        let mut config = Config::default();
+        // Not set — should be omitted
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("relative_paths"));
+
+        // Set — should appear
+        config.set_relative_paths(true);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("relative_paths"));
+
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.use_relative_paths());
     }
 }

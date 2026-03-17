@@ -226,6 +226,12 @@ EXAMPLES:
     # Clear all force-include patterns
     colgrep settings --clear-force-include
 
+    # Show relative paths in search output (saves tokens for LLM usage)
+    colgrep settings --relative-paths
+
+    # Show absolute paths in search output (default)
+    colgrep settings --no-relative-paths
+
 NOTES:
     • Values are stored in ~/.config/colgrep/config.json
     • Use 0 to reset a value to its default
@@ -238,7 +244,8 @@ NOTES:
     • Extra ignore patterns add to the built-in defaults (node_modules, .git, target, etc.)
     • Force-include patterns override both built-in and extra ignore rules
     • Patterns match directory/file names (e.g., \".vscode\") or path prefixes (e.g., \"vendor/internal\")
-    • Suffix patterns with * are supported (e.g., \"*.pb.go\")";
+    • Suffix patterns with * are supported (e.g., \"*.pb.go\")
+    • Use --relative-paths to display paths relative to the current directory (saves ~35% tokens for LLM usage)";
 
 #[derive(Parser)]
 #[command(
@@ -572,6 +579,14 @@ pub enum Commands {
         /// Disable verbose output (show compact filepath:lines format, this is the default)
         #[arg(long = "no-verbose", conflicts_with = "verbose")]
         no_verbose: bool,
+
+        /// Show relative paths in search output (relative to current directory)
+        #[arg(long = "relative-paths", conflicts_with = "no_relative_paths")]
+        relative_paths: bool,
+
+        /// Show absolute paths in search output (this is the default)
+        #[arg(long = "no-relative-paths", conflicts_with = "relative_paths")]
+        no_relative_paths: bool,
 
         /// Add patterns to ignore during indexing (on top of defaults)
         /// Can be repeated. Examples: --ignore generated --ignore "*.pb.go"

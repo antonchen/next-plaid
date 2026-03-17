@@ -227,6 +227,20 @@ colgrep settings --verbose
 colgrep settings --k 0 --n 0
 ```
 
+### Relative Paths
+
+By default, colgrep displays absolute file paths in search output. You can switch to relative paths (relative to the current working directory) to improve readability and save ~35% tokens when used with LLMs:
+
+```bash
+# Enable relative paths
+colgrep settings --relative-paths
+
+# Revert to absolute paths (default)
+colgrep settings --no-relative-paths
+```
+
+> **Note:** JSON output (`--json`) always uses absolute paths regardless of this setting.
+
 ### Custom Ignore & Force-Include
 
 By default, colgrep ignores common non-source directories (`node_modules`, `.git`, `target`, `vendor`, `build`, etc.) and hidden files. You can customize this behavior persistently across sessions:

@@ -103,6 +103,8 @@ pub fn cmd_config(
     max_recursion_depth: Option<usize>,
     verbose: bool,
     no_verbose: bool,
+    relative_paths: bool,
+    no_relative_paths: bool,
     add_ignore: Vec<String>,
     remove_ignore: Vec<String>,
     add_force_include: Vec<String>,
@@ -130,6 +132,8 @@ pub fn cmd_config(
         && max_recursion_depth.is_none()
         && !verbose
         && !no_verbose
+        && !relative_paths
+        && !no_relative_paths
         && !has_ignore_changes
     {
         println!("Current configuration:");
@@ -195,6 +199,13 @@ pub fn cmd_config(
             println!("  verbose:     false (default)");
         }
 
+        // relative paths
+        if config.use_relative_paths() {
+            println!("  rel-paths:   true");
+        } else {
+            println!("  rel-paths:   false (default)");
+        }
+
         // max recursion depth
         let max_depth = config.get_max_recursion_depth();
         if config.max_recursion_depth.is_some() {
@@ -229,6 +240,7 @@ pub fn cmd_config(
             "Use --max-recursion-depth to set parser recursion guard. Use 0 to reset to default."
         );
         println!("Use --verbose or --no-verbose to set default output mode.");
+        println!("Use --relative-paths or --no-relative-paths to toggle relative/absolute paths.");
         println!("Use --ignore/--no-ignore to add/remove extra ignore patterns. --clear-ignore to reset.");
         println!("Use --force-include/--no-force-include to add/remove force-include patterns. --clear-force-include to reset.");
         return Ok(());
@@ -335,6 +347,17 @@ pub fn cmd_config(
     } else if no_verbose {
         config.clear_verbose();
         println!("✅ Disabled verbose output (compact mode is now default)");
+        changed = true;
+    }
+
+    // Set relative paths or no_relative_paths
+    if relative_paths {
+        config.set_relative_paths(true);
+        println!("✅ Enabled relative paths in search output");
+        changed = true;
+    } else if no_relative_paths {
+        config.clear_relative_paths();
+        println!("✅ Disabled relative paths (absolute paths are now default)");
         changed = true;
     }
 
