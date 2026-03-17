@@ -9,6 +9,7 @@
   "repository": "https://github.com/lightonai/next-plaid",
   "homepage": "https://github.com/lightonai/next-plaid/tree/main/colgrep",
   "license": "MIT",
+  "privacy_policy": "https://github.com/lightonai/next-plaid/blob/main/colgrep/PRIVACY.md",
   "keywords": ["code-search", "semantic-search", "colbert", "grep", "productivity"],
   "hooks": "./hooks/hook.json"
 }
