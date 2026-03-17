@@ -49,7 +49,6 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
-    libopenblas-dev \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -97,7 +96,7 @@ FROM chef-cpu AS builder-cpu
 
 # Build dependencies first (this layer is cached if recipe.json doesn't change)
 COPY --from=planner-cpu /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --package next-plaid-api --features "openblas,model"
+RUN cargo chef cook --release --recipe-path recipe.json --package next-plaid-api --features "mkl,model"
 
 # Now build the actual application
 COPY Cargo.toml Cargo.lock ./
@@ -106,7 +105,7 @@ COPY next-plaid-api ./next-plaid-api
 COPY next-plaid-onnx ./next-plaid-onnx
 COPY colgrep ./colgrep
 
-RUN cargo build --release --package next-plaid-api --features "openblas,model"
+RUN cargo build --release --package next-plaid-api --features "mkl,model"
 
 # =============================================================================
 # Chef stage for CUDA - Install cargo-chef
@@ -178,12 +177,11 @@ FROM debian:bookworm-slim AS runtime-cpu
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies (MKL is statically linked, no BLAS runtime needed)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libsqlite3-0 \
-    libopenblas0 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -216,8 +214,7 @@ EXPOSE 8080
 # Default environment variables
 ENV RUST_LOG=info
 ENV INDEX_DIR=/data/indices
-# Prevent OpenBLAS thread explosion when used alongside rayon parallelism
-ENV OPENBLAS_NUM_THREADS=1
+# MKL is statically linked with sequential threading (no thread explosion risk)
 # Memory-mapped indices are always enabled for efficient memory usage
 # Set HF_MODEL_ID to auto-download model from HuggingFace Hub
 # Example: ENV HF_MODEL_ID=lightonai/GTE-ModernColBERT-v1
