@@ -220,67 +220,6 @@ END:
 }
 "#;
 
-/// MaxSim kernel - computes max similarity per query token.
-const MAXSIM_KERNEL: &str = r#"
-.version 7.0
-.target sm_70
-.address_size 64
-
-.visible .entry maxsim_kernel(
-    .param .u64 scores_ptr,
-    .param .u64 max_scores_ptr,
-    .param .u32 num_query_tokens,
-    .param .u32 num_doc_tokens
-)
-{
-    .reg .u32 %r<20>;
-    .reg .u64 %rd<10>;
-    .reg .f32 %f<5>;
-    .reg .pred %p<3>;
-
-    mov.u32 %r0, %ctaid.x;
-    mov.u32 %r1, %ntid.x;
-    mov.u32 %r2, %tid.x;
-    mad.lo.u32 %r3, %r0, %r1, %r2;
-
-    ld.param.u64 %rd0, [scores_ptr];
-    ld.param.u64 %rd1, [max_scores_ptr];
-    ld.param.u32 %r4, [num_query_tokens];
-    ld.param.u32 %r5, [num_doc_tokens];
-
-    setp.ge.u32 %p0, %r3, %r4;
-    @%p0 bra END;
-
-    mul.wide.u32 %rd2, %r3, %r5;
-    shl.b64 %rd2, %rd2, 2;
-    add.u64 %rd3, %rd0, %rd2;
-
-    ld.global.f32 %f0, [%rd3];
-    mov.u32 %r7, 1;
-
-LOOP:
-    setp.ge.u32 %p1, %r7, %r5;
-    @%p1 bra STORE;
-
-    mul.wide.u32 %rd4, %r7, 4;
-    add.u64 %rd5, %rd3, %rd4;
-    ld.global.f32 %f1, [%rd5];
-
-    max.f32 %f0, %f0, %f1;
-
-    add.u32 %r7, %r7, 1;
-    bra LOOP;
-
-STORE:
-    mul.wide.u32 %rd6, %r3, 4;
-    add.u64 %rd7, %rd1, %rd6;
-    st.global.f32 [%rd7], %f0;
-
-END:
-    ret;
-}
-"#;
-
 /// Load PTX kernels into the device.
 fn load_kernels(device: &Arc<CudaDevice>) -> Result<()> {
     device
@@ -298,14 +237,6 @@ fn load_kernels(device: &Arc<CudaDevice>) -> Result<()> {
             &["gather_subtract_kernel"],
         )
         .map_err(|e| Error::Codec(format!("Failed to load gather_subtract kernel: {}", e)))?;
-
-    device
-        .load_ptx(
-            cudarc::nvrtc::Ptx::from_src(MAXSIM_KERNEL),
-            "maxsim",
-            &["maxsim_kernel"],
-        )
-        .map_err(|e| Error::Codec(format!("Failed to load maxsim kernel: {}", e)))?;
 
     Ok(())
 }
@@ -627,107 +558,6 @@ pub fn compress_and_residuals_cuda_batched(
     Ok((Array1::from_vec(all_codes), all_residuals))
 }
 
-/// CUDA-accelerated ColBERT MaxSim scoring.
-/// Used internally by colbert_score when cuda feature is enabled and matrices are large.
-pub fn colbert_score_cuda(
-    ctx: &CudaContext,
-    query: &ArrayView2<f32>,
-    doc: &ArrayView2<f32>,
-) -> Result<f32> {
-    let num_query_tokens = query.nrows();
-    let num_doc_tokens = doc.nrows();
-    let dim = query.ncols();
-
-    if num_query_tokens == 0 || num_doc_tokens == 0 {
-        return Ok(0.0);
-    }
-
-    let query_cont = if query.is_standard_layout() {
-        query.to_owned()
-    } else {
-        query.as_standard_layout().to_owned()
-    };
-    let doc_cont = if doc.is_standard_layout() {
-        doc.to_owned()
-    } else {
-        doc.as_standard_layout().to_owned()
-    };
-
-    let query_gpu = ctx
-        .device
-        .htod_sync_copy(query_cont.as_slice().unwrap())
-        .map_err(|e| Error::Codec(format!("Failed to copy query to GPU: {}", e)))?;
-
-    let doc_gpu = ctx
-        .device
-        .htod_sync_copy(doc_cont.as_slice().unwrap())
-        .map_err(|e| Error::Codec(format!("Failed to copy doc to GPU: {}", e)))?;
-
-    let mut scores_gpu: CudaSlice<f32> = ctx
-        .device
-        .alloc_zeros(num_query_tokens * num_doc_tokens)
-        .map_err(|e| Error::Codec(format!("Failed to allocate scores: {}", e)))?;
-
-    // GEMM: scores = query @ doc.T
-    let cfg = GemmConfig {
-        transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
-        transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-        m: num_doc_tokens as i32,
-        n: num_query_tokens as i32,
-        k: dim as i32,
-        alpha: 1.0f32,
-        lda: dim as i32,
-        ldb: dim as i32,
-        beta: 0.0f32,
-        ldc: num_doc_tokens as i32,
-    };
-
-    unsafe {
-        ctx.blas
-            .gemm(cfg, &doc_gpu, &query_gpu, &mut scores_gpu)
-            .map_err(|e| Error::Codec(format!("cuBLAS GEMM failed: {}", e)))?;
-    }
-
-    // Kernels are preloaded in CudaContext::new()
-
-    let mut max_scores_gpu: CudaSlice<f32> = ctx
-        .device
-        .alloc_zeros(num_query_tokens)
-        .map_err(|e| Error::Codec(format!("Failed to allocate max_scores: {}", e)))?;
-
-    let func = ctx
-        .device
-        .get_func("maxsim", "maxsim_kernel")
-        .ok_or_else(|| Error::Codec("Failed to get maxsim function".into()))?;
-
-    let block_size = 256;
-    let grid_size = num_query_tokens.div_ceil(block_size);
-
-    unsafe {
-        func.launch(
-            LaunchConfig {
-                block_dim: (block_size as u32, 1, 1),
-                grid_dim: (grid_size as u32, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            (
-                &scores_gpu,
-                &mut max_scores_gpu,
-                num_query_tokens as u32,
-                num_doc_tokens as u32,
-            ),
-        )
-        .map_err(|e| Error::Codec(format!("MaxSim kernel failed: {}", e)))?;
-    }
-
-    let max_scores_host = ctx
-        .device
-        .dtoh_sync_copy(&max_scores_gpu)
-        .map_err(|e| Error::Codec(format!("Failed to copy max_scores: {}", e)))?;
-
-    Ok(max_scores_host.iter().sum())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,15 +585,5 @@ mod tests {
         for &code in codes.iter() {
             assert!(code < 64);
         }
-    }
-
-    #[test]
-    fn test_colbert_score_cuda() {
-        let ctx = CudaContext::new(0).expect("No CUDA");
-        let query = Array2::random((32, 128), Uniform::new(-1.0f32, 1.0));
-        let doc = Array2::random((256, 128), Uniform::new(-1.0f32, 1.0));
-
-        let score = colbert_score_cuda(&ctx, &query.view(), &doc.view()).expect("CUDA failed");
-        assert!(score.is_finite());
     }
 }
