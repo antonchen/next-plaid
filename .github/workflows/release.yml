@@ -157,7 +157,7 @@ jobs:
               FEATURES='features = ["mkl"]'
               ;;
             *x86_64-pc-windows*)
-              FEATURES='features = ["mkl"]'
+              FEATURES='features = ["mkl", "directml"]'
               ;;
             *)
               FEATURES=""
