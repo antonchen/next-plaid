@@ -306,6 +306,19 @@ pub fn resolve_context_lines(cli_n: Option<usize>, default: usize) -> usize {
     default
 }
 
+/// Convert an absolute path to a relative path based on the current working directory.
+/// Falls back to the original path if stripping fails.
+fn display_relative(path: &Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
 /// Resolve verbose: saved config > default (false)
 pub fn resolve_verbose() -> bool {
     if let Ok(config) = Config::load() {
@@ -432,7 +445,7 @@ pub fn cmd_search(
         // -l mode: show only unique filenames
         let mut seen_files = std::collections::HashSet::new();
         for result in &results {
-            let file_str = result.unit.file.display().to_string();
+            let file_str = display_relative(&result.unit.file);
             if seen_files.insert(file_str.clone()) {
                 println!("{}", file_str);
             }
@@ -455,7 +468,7 @@ pub fn cmd_search(
         if !verbose {
             // Non-verbose (compact) mode: show filepath:lines (score: X.XX) ordered by score
             for result in &results {
-                let file_path = result.unit.file.display();
+                let file_path = display_relative(&result.unit.file);
                 let start_line = result.unit.line;
                 let end_line = result.unit.end_line;
                 let score = result.score;
@@ -492,8 +505,8 @@ pub fn cmd_search(
             if !code_results.is_empty() {
                 let grouped = group_results_by_file(&code_results);
                 for (file, file_results) in grouped {
-                    // Print file header (file paths are absolute from search_single_path)
-                    println!("file: {}", file.display().to_string().cyan());
+                    // Print file header with relative path
+                    println!("file: {}", display_relative(&file).cyan());
                     for result in file_results {
                         let file_to_read = &result.unit.file;
                         if let Ok(content) = std::fs::read_to_string(file_to_read) {
@@ -593,7 +606,7 @@ pub fn cmd_search(
             if !doc_results.is_empty() {
                 let grouped = group_results_by_file(&doc_results);
                 for (file, file_results) in grouped {
-                    println!("file: {}", file.display().to_string().cyan());
+                    println!("file: {}", display_relative(&file).cyan());
                     for result in file_results {
                         let file_to_read = &result.unit.file;
                         if let Ok(content) = std::fs::read_to_string(file_to_read) {
