@@ -227,44 +227,44 @@ ifndef VERSION
 endif
 	@echo "Bumping version to $(VERSION)..."
 	@# Update workspace version in root Cargo.toml (line 6 in [workspace.package])
-	@sed -i '' '/^\[workspace\.package\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' Cargo.toml
+	@sed -i '/^\[workspace\.package\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' Cargo.toml
 	@echo "  ✓ Updated workspace version in Cargo.toml"
 	@# Update path dependency versions in colgrep/Cargo.toml
-	@sed -i '' 's/next-plaid = { path = "..\/next-plaid", version = "[^"]*"/next-plaid = { path = "..\/next-plaid", version = "$(VERSION)"/' colgrep/Cargo.toml
-	@sed -i '' 's/next-plaid-onnx = { path = "..\/next-plaid-onnx", version = "[^"]*"/next-plaid-onnx = { path = "..\/next-plaid-onnx", version = "$(VERSION)"/' colgrep/Cargo.toml
+	@sed -i 's/next-plaid = { path = "..\/next-plaid", version = "[^"]*"/next-plaid = { path = "..\/next-plaid", version = "$(VERSION)"/' colgrep/Cargo.toml
+	@sed -i 's/next-plaid-onnx = { path = "..\/next-plaid-onnx", version = "[^"]*"/next-plaid-onnx = { path = "..\/next-plaid-onnx", version = "$(VERSION)"/' colgrep/Cargo.toml
 	@echo "  ✓ Updated path dependencies in colgrep/Cargo.toml"
 	@# Update Claude plugin versions
-	@sed -i '' 's/"version": "[^"]*"/"version": "$(VERSION)"/' colgrep/src/install/plugin.json
-	@sed -i '' 's/"version": "[^"]*"/"version": "$(VERSION)"/' colgrep/src/install/marketplace.json
-	@sed -i '' 's/"version": "[^"]*"/"version": "$(VERSION)"/' .claude-plugin/marketplace.json
-	@sed -i '' 's/"version": "[^"]*"/"version": "$(VERSION)"/' plugins/colgrep/.claude-plugin/plugin.json
+	@sed -i 's/"version": "[^"]*"/"version": "$(VERSION)"/' colgrep/src/install/plugin.json
+	@sed -i 's/"version": "[^"]*"/"version": "$(VERSION)"/' colgrep/src/install/marketplace.json
+	@sed -i 's/"version": "[^"]*"/"version": "$(VERSION)"/' .claude-plugin/marketplace.json
+	@test -f plugins/colgrep/.claude-plugin/plugin.json && sed -i 's/"version": "[^"]*"/"version": "$(VERSION)"/' plugins/colgrep/.claude-plugin/plugin.json || true
 	@echo "  ✓ Updated Claude plugin versions"
 	@# Update OpenAPI version in next-plaid-api/src/main.rs
-	@sed -i '' 's/version = "[^"]*",/version = "$(VERSION)",/' next-plaid-api/src/main.rs
+	@sed -i 's/version = "[^"]*",/version = "$(VERSION)",/' next-plaid-api/src/main.rs
 	@echo "  ✓ Updated OpenAPI version in next-plaid-api/src/main.rs"
 	@# Update Python SDK version in pyproject.toml (in [project] section)
-	@sed -i '' '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' next-plaid-api/python-sdk/pyproject.toml
+	@sed -i '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' next-plaid-api/python-sdk/pyproject.toml
 	@echo "  ✓ Updated next-plaid-api/python-sdk/pyproject.toml"
 	@# Update Python SDK __version__ in __init__.py
-	@sed -i '' 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' next-plaid-api/python-sdk/next_plaid_client/__init__.py
+	@sed -i 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' next-plaid-api/python-sdk/next_plaid_client/__init__.py
 	@echo "  ✓ Updated next-plaid-api/python-sdk/next_plaid_client/__init__.py"
 	@# Update ONNX Python package versions
-	@sed -i '' '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' next-plaid-onnx/python/pyproject.toml
-	@sed -i '' 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' next-plaid-onnx/python/src/colbert_export/__init__.py
-	@sed -i '' 's/version="%(prog)s [^"]*"/version="%(prog)s $(VERSION)"/' next-plaid-onnx/python/src/colbert_export/cli.py
-	@sed -i '' 's/assert "[0-9]*\.[0-9]*\.[0-9]*" in result.stdout/assert "$(VERSION)" in result.stdout/' next-plaid-onnx/python/tests/test_cli.py
+	@sed -i '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' next-plaid-onnx/python/pyproject.toml
+	@sed -i 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' next-plaid-onnx/python/src/colbert_export/__init__.py
+	@sed -i 's/version="%(prog)s [^"]*"/version="%(prog)s $(VERSION)"/' next-plaid-onnx/python/src/colbert_export/cli.py
+	@sed -i 's/assert "[0-9]*\.[0-9]*\.[0-9]*" in result.stdout/assert "$(VERSION)" in result.stdout/' next-plaid-onnx/python/tests/test_cli.py
 	@echo "  ✓ Updated next-plaid-onnx/python versions"
 	@# Update colgrep-parser Python SDK versions
-	@sed -i '' '/^\[package\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' colgrep/python-sdk/Cargo.toml
-	@sed -i '' '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' colgrep/python-sdk/pyproject.toml
-	@sed -i '' 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' colgrep/python-sdk/python/colgrep_parser/__init__.py
+	@sed -i '/^\[package\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' colgrep/python-sdk/Cargo.toml
+	@sed -i '/^\[project\]/,/^\[/{s/^version = "[^"]*"/version = "$(VERSION)"/;}' colgrep/python-sdk/pyproject.toml
+	@sed -i 's/__version__ = "[^"]*"/__version__ = "$(VERSION)"/' colgrep/python-sdk/python/colgrep_parser/__init__.py
 	@echo "  ✓ Updated colgrep/python-sdk versions"
 	@# Update Docker image tags in READMEs and Cargo.toml
-	@sed -i '' 's/next-plaid:cpu-[0-9]*\.[0-9]*\.[0-9]*/next-plaid:cpu-$(VERSION)/g' README.md next-plaid-api/README.md Cargo.toml
-	@sed -i '' 's/next-plaid:cuda-[0-9]*\.[0-9]*\.[0-9]*/next-plaid:cuda-$(VERSION)/g' README.md next-plaid-api/README.md Cargo.toml
+	@sed -i 's/next-plaid:cpu-[0-9]*\.[0-9]*\.[0-9]*/next-plaid:cpu-$(VERSION)/g' README.md next-plaid-api/README.md Cargo.toml
+	@sed -i 's/next-plaid:cuda-[0-9]*\.[0-9]*\.[0-9]*/next-plaid:cuda-$(VERSION)/g' README.md next-plaid-api/README.md Cargo.toml
 	@echo "  ✓ Updated Docker image tags"
 	@# Update README crate version (major.minor only)
-	@sed -i '' 's/next-plaid = "[0-9]*\.[0-9]*"/next-plaid = "$(shell echo $(VERSION) | cut -d. -f1,2)"/' README.md
+	@sed -i 's/next-plaid = "[0-9]*\.[0-9]*"/next-plaid = "$(shell echo $(VERSION) | cut -d. -f1,2)"/' README.md
 	@echo "  ✓ Updated README.md crate version"
 	@# Update lock files
 	@cargo check --quiet
