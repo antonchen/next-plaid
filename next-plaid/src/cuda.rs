@@ -266,10 +266,10 @@ pub fn compress_into_codes_cuda_batched(
     };
 
     // Upload centroids once (reused across batches)
-    let centroids_gpu: CudaSlice<f32> = ctx
-        .stream
-        .clone_htod(centroids_cont.as_slice().unwrap())
-        .map_err(|e| Error::Codec(format!("Failed to copy centroids to GPU: {:?}", e)))?;
+    let centroids_gpu: CudaSlice<f32> =
+        ctx.stream
+            .clone_htod(centroids_cont.as_slice().unwrap())
+            .map_err(|e| Error::Codec(format!("Failed to copy centroids to GPU: {:?}", e)))?;
 
     // Kernels are preloaded in CudaContext::new()
 
@@ -409,10 +409,10 @@ pub fn compress_and_residuals_cuda_batched(
     };
 
     // Upload centroids once (reused across batches)
-    let centroids_gpu: CudaSlice<f32> = ctx
-        .stream
-        .clone_htod(centroids_cont.as_slice().unwrap())
-        .map_err(|e| Error::Codec(format!("Failed to copy centroids to GPU: {:?}", e)))?;
+    let centroids_gpu: CudaSlice<f32> =
+        ctx.stream
+            .clone_htod(centroids_cont.as_slice().unwrap())
+            .map_err(|e| Error::Codec(format!("Failed to copy centroids to GPU: {:?}", e)))?;
 
     // Kernels are preloaded in CudaContext::new()
 

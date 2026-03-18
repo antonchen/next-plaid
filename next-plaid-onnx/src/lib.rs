@@ -351,12 +351,10 @@ fn configure_cuda(builder: SessionBuilder) -> Result<SessionBuilder> {
         let device_id = get_cuda_device_id();
         builder
             .clone()
-            .with_execution_providers([
-                CUDAExecutionProvider::default()
-                    .with_device_id(device_id)
-                    .with_tf32(true)
-                    .build()
-            ])
+            .with_execution_providers([CUDAExecutionProvider::default()
+                .with_device_id(device_id)
+                .with_tf32(true)
+                .build()])
     }));
 
     match cuda_result {

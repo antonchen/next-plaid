@@ -121,22 +121,19 @@ pub fn compute_centroids(
     }
 
     // Try CUDA first, catching panics from invalid/stub CUDA libraries
-    let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match FastKMeansCuda::with_config(config.clone()) {
-            Ok(mut kmeans) => {
-                match kmeans.train(embeddings) {
-                    Ok(()) => {
-                        kmeans
-                            .centroids()
-                            .map(|c| c.to_owned())
-                            .ok_or_else(|| "CUDA K-means did not produce centroids".to_string())
-                    }
+    let cuda_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || match FastKMeansCuda::with_config(config.clone()) {
+                Ok(mut kmeans) => match kmeans.train(embeddings) {
+                    Ok(()) => kmeans
+                        .centroids()
+                        .map(|c| c.to_owned())
+                        .ok_or_else(|| "CUDA K-means did not produce centroids".to_string()),
                     Err(e) => Err(format!("CUDA K-means training failed: {}", e)),
-                }
-            }
-            Err(e) => Err(format!("CUDA K-means init failed: {}", e)),
-        }
-    }));
+                },
+                Err(e) => Err(format!("CUDA K-means init failed: {}", e)),
+            },
+        ));
 
     match cuda_result {
         Ok(Ok(centroids)) => Ok(centroids),
@@ -147,7 +144,9 @@ pub fn compute_centroids(
         }
         Err(_) => {
             crate::cuda::mark_cuda_broken();
-            eprintln!("[next-plaid] CUDA K-means panicked (invalid/stub library?), falling back to CPU");
+            eprintln!(
+                "[next-plaid] CUDA K-means panicked (invalid/stub library?), falling back to CPU"
+            );
             compute_centroids_cpu(embeddings, config)
         }
     }
@@ -353,12 +352,10 @@ pub fn compute_kmeans(
         let samples_view = samples_tensor.view();
         let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match FastKMeansCuda::with_config(kmeans_config.clone()) {
-                Ok(mut kmeans) => {
-                    match kmeans.train(&samples_view) {
-                        Ok(()) => kmeans.centroids().map(|c| c.to_owned()),
-                        Err(_) => None,
-                    }
-                }
+                Ok(mut kmeans) => match kmeans.train(&samples_view) {
+                    Ok(()) => kmeans.centroids().map(|c| c.to_owned()),
+                    Err(_) => None,
+                },
                 Err(_) => None,
             }
         }));
