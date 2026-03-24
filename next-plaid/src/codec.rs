@@ -252,7 +252,7 @@ impl ResidualCodec {
                     Ok(codes) => return codes,
                     Err(e) => {
                         eprintln!(
-                            "[next-plaid] CUDA compress_into_codes failed: {}, falling back to CPU",
+                            "[next-plaid] CUDA compression error: {}. Falling back to CPU.",
                             e
                         );
                     }

@@ -341,13 +341,8 @@ fn check_cudnn_available() -> bool {
         }
     }
 
-    // cuDNN not found - print warning and set flag
-    // (ONNX Runtime will fall back to CPU if CUDA doesn't work)
+    // cuDNN not found — ONNX Runtime will fall back to CPU silently
     let _ = CUDNN_AVAILABLE.set(false);
-    eprintln!(
-        "⚠️  Warning: cuDNN not found. CUDA acceleration requires cuDNN. Falling back to CPU mode."
-    );
-
     false
 }
 

@@ -19,12 +19,29 @@ use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
     CudaContext as CudarcContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use ndarray::{Array1, ArrayView2};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
+
+/// Run a closure, catching panics without printing the default panic message.
+///
+/// When CUDA libraries are stubs or incomplete, `cudarc` panics inside `dlsym`.
+/// The default panic hook prints a scary `thread 'main' panicked at …` message
+/// before `catch_unwind` has a chance to handle it. This helper temporarily
+/// replaces the hook with a no-op so users only see our clean fallback message.
+pub fn catch_cuda_panic<F, R>(f: F) -> std::result::Result<R, Box<dyn std::any::Any + Send>>
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev_hook);
+    result
+}
 
 /// Default maximum GPU memory to use (4GB)
 const DEFAULT_MAX_GPU_MEMORY: usize = 4 * 1024 * 1024 * 1024;
@@ -97,8 +114,9 @@ pub fn get_global_context() -> Option<Arc<CudaContext>> {
     }
 
     // Try to initialize CUDA
-    // Wrap in catch_unwind to handle panics from invalid/stub CUDA libraries
-    match std::panic::catch_unwind(|| CudaContext::new(0)) {
+    // Wrap in catch_cuda_panic to handle panics from invalid/stub CUDA libraries
+    // without printing the default panic message to stderr
+    match catch_cuda_panic(|| CudaContext::new(0)) {
         Ok(Ok(ctx)) => {
             let ctx = Arc::new(ctx);
             *guard = Some(Arc::clone(&ctx));
@@ -106,12 +124,17 @@ pub fn get_global_context() -> Option<Arc<CudaContext>> {
         }
         Ok(Err(e)) => {
             CUDA_BROKEN.store(true, Ordering::Relaxed);
-            eprintln!("[next-plaid] CUDA init failed: {}, using CPU", e);
+            eprintln!(
+                "[next-plaid] CUDA initialization error: {}. Falling back to CPU. \
+                       Set NEXT_PLAID_FORCE_CPU=1 to skip CUDA and silence this warning.",
+                e
+            );
             None
         }
         Err(_) => {
             CUDA_BROKEN.store(true, Ordering::Relaxed);
-            eprintln!("[next-plaid] CUDA init panicked (invalid/stub library?), using CPU");
+            eprintln!("[next-plaid] CUDA library found but missing required symbols (stub or incompatible driver). \
+                       Falling back to CPU. Install a full NVIDIA driver or set NEXT_PLAID_FORCE_CPU=1 to silence this warning.");
             None
         }
     }
@@ -211,8 +234,20 @@ extern "C" __global__ void gather_subtract_kernel(
 "#;
 
 /// Compile and load CUDA kernels, returning the kernel functions.
+///
+/// Targets the device's actual compute capability to avoid
+/// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` when the NVRTC compiler is newer
+/// than the installed driver.
 fn load_kernels(device: &Arc<CudarcContext>) -> Result<(CudaFunction, CudaFunction)> {
-    let ptx = compile_ptx(CUDA_KERNELS)
+    let opts = match device.compute_capability() {
+        Ok((major, minor)) => CompileOptions {
+            options: vec![format!("--gpu-architecture=sm_{}{}", major, minor)],
+            ..Default::default()
+        },
+        Err(_) => CompileOptions::default(),
+    };
+
+    let ptx = compile_ptx_with_opts(CUDA_KERNELS, opts)
         .map_err(|e| Error::Codec(format!("Failed to compile CUDA kernels: {:?}", e)))?;
 
     let module = device

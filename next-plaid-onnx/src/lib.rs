@@ -66,6 +66,20 @@ use tokenizers::Tokenizer;
 use ort::ep::ExecutionProvider as ExecutionProviderTrait;
 #[cfg(feature = "cuda")]
 use ort::execution_providers::CUDAExecutionProvider;
+
+/// Run a closure, catching panics without printing the default panic message.
+/// See `next_plaid::cuda::catch_cuda_panic` for the rationale.
+#[cfg(feature = "cuda")]
+fn catch_cuda_panic<F, R>(f: F) -> std::result::Result<R, Box<dyn std::any::Any + Send>>
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev_hook);
+    result
+}
 #[cfg(feature = "coreml")]
 use ort::execution_providers::CoreMLExecutionProvider;
 #[cfg(feature = "directml")]
@@ -246,13 +260,13 @@ pub fn is_cuda_available() -> bool {
 
     // Try to check if CUDA EP is available, catching any panics from CUDA driver loading
     // This can panic if CUDA libraries are present but corrupted/incomplete (stub libraries)
-    std::panic::catch_unwind(|| {
+    catch_cuda_panic(|| {
         CUDAExecutionProvider::default()
             .is_available()
             .unwrap_or(false)
     })
     .unwrap_or_else(|_| {
-        eprintln!("[next-plaid-onnx] CUDA driver check failed (invalid/stub library?), using CPU");
+        eprintln!("[next-plaid-onnx] CUDA library found but missing required symbols (stub or incompatible driver). Using CPU.");
         false
     })
 }
@@ -277,8 +291,9 @@ fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
 
     #[cfg(feature = "cuda")]
     if !force_cpu {
-        // Wrap CUDA initialization in catch_unwind to handle panics from stub libraries
-        let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Wrap CUDA initialization in catch_cuda_panic to handle panics from stub libraries
+        // without printing the default panic message to stderr
+        let cuda_result = catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
             let device_id = get_cuda_device_id();
             builder
                 .clone()
@@ -291,7 +306,7 @@ fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
             Ok(Ok(b)) => return Ok(b),
             Ok(Err(_)) => { /* CUDA failed normally, try next provider */ }
             Err(_) => {
-                eprintln!("[next-plaid-onnx] CUDA init panicked (invalid/stub library?), falling back to CPU");
+                eprintln!("[next-plaid-onnx] CUDA library found but missing required symbols (stub or incompatible driver). Using CPU.");
             }
         }
     }
@@ -346,8 +361,9 @@ fn configure_cuda(builder: SessionBuilder) -> Result<SessionBuilder> {
         return Ok(builder);
     }
 
-    // Wrap CUDA initialization in catch_unwind to handle panics from stub/invalid libraries
-    let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Wrap CUDA initialization in catch_cuda_panic to handle panics from stub/invalid libraries
+    // without printing the default panic message to stderr
+    let cuda_result = catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
         let device_id = get_cuda_device_id();
         builder
             .clone()

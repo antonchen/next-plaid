@@ -121,31 +121,34 @@ pub fn compute_centroids(
     }
 
     // Try CUDA first, catching panics from invalid/stub CUDA libraries
-    let cuda_result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || match FastKMeansCuda::with_config(config.clone()) {
-                Ok(mut kmeans) => match kmeans.train(embeddings) {
-                    Ok(()) => kmeans
-                        .centroids()
-                        .map(|c| c.to_owned())
-                        .ok_or_else(|| "CUDA K-means did not produce centroids".to_string()),
-                    Err(e) => Err(format!("CUDA K-means training failed: {}", e)),
-                },
-                Err(e) => Err(format!("CUDA K-means init failed: {}", e)),
+    let cuda_result = crate::cuda::catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
+        match FastKMeansCuda::with_config(config.clone()) {
+            Ok(mut kmeans) => match kmeans.train(embeddings) {
+                Ok(()) => kmeans
+                    .centroids()
+                    .map(|c| c.to_owned())
+                    .ok_or_else(|| "CUDA K-means did not produce centroids".to_string()),
+                Err(e) => Err(format!("CUDA K-means training failed: {}", e)),
             },
-        ));
+            Err(e) => Err(format!("CUDA K-means init failed: {}", e)),
+        }
+    }));
 
     match cuda_result {
         Ok(Ok(centroids)) => Ok(centroids),
         Ok(Err(e)) => {
             crate::cuda::mark_cuda_broken();
-            eprintln!("[next-plaid] {}, falling back to CPU", e);
+            eprintln!(
+                "[next-plaid] CUDA K-means error: {}. Falling back to CPU.",
+                e
+            );
             compute_centroids_cpu(embeddings, config)
         }
         Err(_) => {
             crate::cuda::mark_cuda_broken();
             eprintln!(
-                "[next-plaid] CUDA K-means panicked (invalid/stub library?), falling back to CPU"
+                "[next-plaid] CUDA library found but missing required symbols (stub or incompatible driver). \
+                 K-means will use CPU instead."
             );
             compute_centroids_cpu(embeddings, config)
         }
@@ -350,7 +353,7 @@ pub fn compute_kmeans(
     } else {
         // Try CUDA, catching panics from invalid/stub CUDA libraries
         let samples_view = samples_tensor.view();
-        let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cuda_result = crate::cuda::catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
             match FastKMeansCuda::with_config(kmeans_config.clone()) {
                 Ok(mut kmeans) => match kmeans.train(&samples_view) {
                     Ok(()) => kmeans.centroids().map(|c| c.to_owned()),
@@ -366,9 +369,12 @@ pub fn compute_kmeans(
                 // Mark CUDA as broken to prevent subsequent attempts
                 crate::cuda::mark_cuda_broken();
                 if cuda_result.is_err() {
-                    eprintln!("[next-plaid] CUDA K-means panicked (invalid/stub library?), falling back to CPU");
+                    eprintln!("[next-plaid] CUDA library found but missing required symbols (stub or incompatible driver). \
+                               K-means will use CPU instead.");
                 } else {
-                    eprintln!("[next-plaid] CUDA K-means failed, falling back to CPU");
+                    eprintln!(
+                        "[next-plaid] CUDA K-means did not produce centroids. Falling back to CPU."
+                    );
                 }
                 // Use kmeans_double_chunked directly to avoid FastKMeans::train() which
                 // tries CUDA when the cuda feature is enabled
