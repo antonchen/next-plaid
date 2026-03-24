@@ -943,14 +943,6 @@ impl IndexBuilder {
 
     /// Full rebuild (used when force=true or no index exists)
     fn full_rebuild(&mut self, languages: Option<&[Language]>) -> Result<UpdateStats> {
-        #[cfg(feature = "cuda")]
-        if !crate::onnx_runtime::is_cudnn_available()
-            && std::env::var("_COLGREP_CUDNN_NOTICE").is_err()
-        {
-            std::env::set_var("_COLGREP_CUDNN_NOTICE", "1");
-            eprintln!("📂 cuDNN not found, encoding will use CPU.");
-        }
-
         let index_path = get_vector_index_path(&self.index_dir);
         let temp_path = self.index_dir.join("index.tmp");
         let old_path = self.index_dir.join("index.old");
@@ -1046,6 +1038,15 @@ impl IndexBuilder {
         let was_interrupted = if !all_units.is_empty() {
             // Ensure model is created before encoding (lazy initialization)
             self.ensure_model_created(all_units.len())?;
+
+            #[cfg(feature = "cuda")]
+            if !crate::onnx_runtime::is_cudnn_available()
+                && std::env::var("_COLGREP_CUDNN_NOTICE").is_err()
+            {
+                std::env::set_var("_COLGREP_CUDNN_NOTICE", "1");
+                eprintln!("📂 cuDNN not found, encoding will use CPU.");
+            }
+
             // Build new index in temp directory to avoid destroying the old one
             self.write_index_impl(&all_units, true, Some(&temp_path))?
         } else {
