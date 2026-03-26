@@ -826,6 +826,9 @@ impl IndexBuilder {
         let mut processed = 0usize;
         let mut was_interrupted = false;
 
+        // Sort units by embedding text length (shortest first) to minimize padding waste
+        sort_units_by_length(&mut new_units);
+
         for (chunk_idx, unit_chunk) in new_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
             let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -1331,6 +1334,9 @@ impl IndexBuilder {
             let mut encoding_duration = std::time::Duration::ZERO;
             let mut processed = 0usize;
 
+            // Sort units by embedding text length (shortest first) to minimize padding waste
+            sort_units_by_length(&mut new_units);
+
             for (chunk_idx, unit_chunk) in new_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
                 let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -1635,6 +1641,14 @@ pub fn path_contains_ignored_dir(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// Sort code units by embedding text length (shortest first) to minimize padding waste
+/// within encoding batches. Units with similar lengths end up in the same batch,
+/// reducing the amount of padding needed. Shortest-first ordering lets users see
+/// progress on smaller units first, with larger units processed at the end.
+fn sort_units_by_length(units: &mut [CodeUnit]) {
+    units.sort_by_cached_key(|u| build_embedding_text(u).len());
+}
+
 /// Check if a path should be ignored, considering user-configured overrides.
 ///
 /// `extra_ignore` - additional patterns to ignore (on top of IGNORED_DIRS)
@@ -1863,7 +1877,11 @@ impl IndexBuilder {
         let mut processed = 0usize;
         let mut was_interrupted = false;
 
-        for (chunk_idx, unit_chunk) in units.chunks(INDEX_CHUNK_SIZE).enumerate() {
+        // Sort units by embedding text length (shortest first) to minimize padding waste
+        let mut sorted_units: Vec<CodeUnit> = units.to_vec();
+        sort_units_by_length(&mut sorted_units);
+
+        for (chunk_idx, unit_chunk) in sorted_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
             // Build embedding text for this chunk
             let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -1889,12 +1907,12 @@ impl IndexBuilder {
 
                 if let Some(ref pb) = pb {
                     let progress = chunk_idx * INDEX_CHUNK_SIZE + chunk_embeddings.len();
-                    pb.set_position(progress.min(units.len()) as u64);
+                    pb.set_position(progress.min(sorted_units.len()) as u64);
 
                     // Compute manual ETA based on encoding time only (excludes write time)
                     if processed > 0 {
                         let time_per_doc = encoding_duration.as_secs_f64() / processed as f64;
-                        let remaining = units.len().saturating_sub(processed);
+                        let remaining = sorted_units.len().saturating_sub(processed);
                         let eta_secs = (time_per_doc * remaining as f64) as u64;
                         let eta_mins = eta_secs / 60;
                         let eta_secs_rem = eta_secs % 60;
