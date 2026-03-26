@@ -1067,6 +1067,12 @@ pub struct MergeManifest {
     /// Number of padding rows used in the merge
     #[serde(default)]
     pub padding_rows: usize,
+    /// Number of chunks expected (for fast-path validation)
+    #[serde(default)]
+    pub num_chunks: usize,
+    /// Mtime of metadata.json at merge time (detects any index modifications)
+    #[serde(default)]
+    pub metadata_mtime: f64,
     /// Total rows in the merged file (including padding)
     #[serde(default)]
     pub total_rows: usize,
@@ -1099,6 +1105,8 @@ fn load_merge_manifest(manifest_path: &Path) -> Option<MergeManifest> {
                         padding_rows: 0,
                         total_rows: 0,
                         ncols: 0,
+                        num_chunks: 0,
+                        metadata_mtime: 0.0,
                     });
                 }
             }
@@ -1146,6 +1154,28 @@ fn get_mtime(path: &Path) -> Result<f64> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| Error::IndexLoad(format!("Invalid mtime: {}", e)))?;
     Ok(duration.as_secs_f64())
+}
+
+/// Compute the NPY header size for a 1D array (without writing).
+fn npy_header_size_1d(len: usize, dtype: &str) -> usize {
+    let header_dict = format!(
+        "{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}",
+        dtype, len
+    );
+    let header_len = header_dict.len();
+    let padding = (64 - ((10 + header_len) % 64)) % 64;
+    10 + header_len + padding + 1 // +1 for the trailing newline
+}
+
+/// Compute the NPY header size for a 2D array (without writing).
+fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
+    let header_dict = format!(
+        "{{'descr': '{}', 'fortran_order': False, 'shape': ({}, {}), }}",
+        dtype, nrows, ncols
+    );
+    let header_len = header_dict.len();
+    let padding = (64 - ((10 + header_len) % 64)) % 64;
+    10 + header_len + padding + 1
 }
 
 /// Write NPY header for a 1D array
@@ -1248,6 +1278,29 @@ pub fn merge_codes_chunks(
     let manifest_path = index_path.join("merged_codes.manifest.json");
     let temp_path = index_path.join("merged_codes.npy.tmp");
     let lock_path = index_path.join("merged_codes.lock");
+
+    // Fast path: if manifest exists with matching params, metadata.json hasn't changed,
+    // and merged file exists with correct size, skip chunk scanning entirely.
+    let metadata_json_path = index_path.join("metadata.json");
+    let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
+    if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
+        if manifest.num_chunks == num_chunks
+            && manifest.padding_rows == padding_rows
+            && manifest.chunks.len() == num_chunks
+            && manifest.total_rows > 0
+            && manifest.metadata_mtime > 0.0
+            && manifest.metadata_mtime == current_metadata_mtime
+            && merged_path.exists()
+        {
+            if let Ok(meta) = std::fs::metadata(&merged_path) {
+                let expected_size = npy_header_size_1d(manifest.total_rows, "<i8")
+                    + manifest.total_rows * std::mem::size_of::<i64>();
+                if meta.len() == expected_size as u64 {
+                    return Ok(merged_path);
+                }
+            }
+        }
+    }
 
     // Acquire exclusive lock to prevent concurrent merge operations.
     // This is critical for multi-process scenarios (e.g., multiple API workers).
@@ -1418,6 +1471,8 @@ pub fn merge_codes_chunks(
         padding_rows,
         total_rows: final_rows,
         ncols: 0, // Not used for 1D codes array
+        num_chunks,
+        metadata_mtime: current_metadata_mtime,
     };
     save_merge_manifest(&manifest_path, &new_manifest)?;
 
@@ -1439,6 +1494,30 @@ pub fn merge_residuals_chunks(
     let manifest_path = index_path.join("merged_residuals.manifest.json");
     let temp_path = index_path.join("merged_residuals.npy.tmp");
     let lock_path = index_path.join("merged_residuals.lock");
+
+    // Fast path: if manifest exists with matching params, metadata.json hasn't changed,
+    // and merged file has correct size, skip chunk scanning entirely.
+    let metadata_json_path = index_path.join("metadata.json");
+    let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
+    if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
+        if manifest.num_chunks == num_chunks
+            && manifest.padding_rows == padding_rows
+            && manifest.chunks.len() == num_chunks
+            && manifest.total_rows > 0
+            && manifest.ncols > 0
+            && manifest.metadata_mtime > 0.0
+            && manifest.metadata_mtime == current_metadata_mtime
+            && merged_path.exists()
+        {
+            if let Ok(meta) = std::fs::metadata(&merged_path) {
+                let expected_size = npy_header_size_2d(manifest.total_rows, manifest.ncols, "|u1")
+                    + manifest.total_rows * manifest.ncols;
+                if meta.len() == expected_size as u64 {
+                    return Ok(merged_path);
+                }
+            }
+        }
+    }
 
     // Acquire exclusive lock to prevent concurrent merge operations.
     // This is critical for multi-process scenarios (e.g., multiple API workers).
@@ -1619,6 +1698,8 @@ pub fn merge_residuals_chunks(
         padding_rows,
         total_rows: final_rows,
         ncols,
+        num_chunks,
+        metadata_mtime: current_metadata_mtime,
     };
     save_merge_manifest(&manifest_path, &new_manifest)?;
 

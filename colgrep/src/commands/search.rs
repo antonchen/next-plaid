@@ -1237,16 +1237,6 @@ fn search_single_path(
     // CLI --alpha overrides config, config overrides default (0.75)
     let hybrid_alpha = alpha.unwrap_or_else(|| config.get_hybrid_alpha());
 
-    // Helper: run search with or without FTS5 hybrid fusion
-    let do_search =
-        |q: &str, k: usize, sub: Option<&[i64]>| -> Result<Vec<colgrep::SearchResult>> {
-            if hybrid_disabled {
-                searcher.search(q, k, sub)
-            } else {
-                searcher.search_hybrid(q, k, sub, hybrid_alpha)
-            }
-        };
-
     // When no -e flag is provided, run BOTH semantic/hybrid search and text-pattern search
     // This ensures exact matches are found even if the vector database doesn't rank them highly
     let results = if let Some(pattern) = &text_pattern {
@@ -1254,10 +1244,40 @@ fn search_single_path(
         // Enhance semantic query with -e pattern (strip regex metacharacters and dedupe tokens)
         let sanitized_pattern = strip_regex_for_semantic(pattern);
         let enhanced_query = merge_query_with_pattern(query, &sanitized_pattern);
-        do_search(&enhanced_query, search_top_k, subset.as_deref())?
+        if hybrid_disabled {
+            searcher.search(&enhanced_query, search_top_k, subset.as_deref())?
+        } else {
+            searcher.search_hybrid(
+                &enhanced_query,
+                search_top_k,
+                subset.as_deref(),
+                hybrid_alpha,
+            )?
+        }
     } else {
+        // Encode query once and reuse across both searches
+        let query_emb = searcher.encode_query(query)?;
+
+        // Run FTS5 once and reuse across both searches
+        let fts5_results = if hybrid_disabled {
+            None
+        } else {
+            searcher.fts5_search(query, search_top_k * 3, subset.as_deref())
+        };
+
         // 1. Run semantic search (with FTS5 fusion if enabled)
-        let semantic_results = do_search(query, search_top_k, subset.as_deref())?;
+        let semantic_results = if hybrid_disabled {
+            searcher.search_with_embedding(&query_emb, search_top_k, subset.as_deref())?
+        } else {
+            searcher.search_hybrid_with_embedding(
+                &query_emb,
+                query,
+                search_top_k,
+                subset.as_deref(),
+                hybrid_alpha,
+                fts5_results.as_ref(),
+            )?
+        };
 
         // 2. Run hybrid search: filter by query text, then semantic rank
         // Use fixed_strings mode to treat the query as a literal pattern
@@ -1279,7 +1299,23 @@ fn search_single_path(
             };
 
             if !hybrid_subset.is_empty() {
-                do_search(query, search_top_k, Some(&hybrid_subset))?
+                // Reuse cached embedding and FTS5 results (filtered to subset)
+                if hybrid_disabled {
+                    searcher.search_with_embedding(
+                        &query_emb,
+                        search_top_k,
+                        Some(&hybrid_subset),
+                    )?
+                } else {
+                    searcher.search_hybrid_with_embedding(
+                        &query_emb,
+                        query,
+                        search_top_k,
+                        Some(&hybrid_subset),
+                        hybrid_alpha,
+                        fts5_results.as_ref(),
+                    )?
+                }
             } else {
                 vec![]
             }
