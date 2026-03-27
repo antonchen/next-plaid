@@ -77,9 +77,9 @@ impl EtaEstimator {
 /// - Indexing non-source files (binaries, data files)
 const MAX_FILE_SIZE: u64 = 512 * 1024;
 
-/// Number of documents to process before writing to the index.
-/// Larger values reduce I/O overhead but use more memory.
-const INDEX_CHUNK_SIZE: usize = 1000;
+/// Number of documents per pipeline chunk for pipelined encode/update.
+/// Kept small so encoding can overlap with index writes on a background thread.
+const PIPELINE_CHUNK_SIZE: usize = 100;
 
 /// Threshold for switching to higher pool factor (fewer embeddings per doc).
 /// When encoding more than this many units, use LARGE_BATCH_POOL_FACTOR.
@@ -114,6 +114,63 @@ pub struct UpdatePlan {
 /// Threshold for prompting user confirmation before indexing.
 /// When encoding more than this many units, prompt the user unless auto_confirm is set.
 pub const CONFIRMATION_THRESHOLD: usize = 30_000;
+
+/// Commit a chunk of embeddings + metadata to the index on the current thread.
+/// This is the unit of work that gets offloaded to a background thread in pipelined mode.
+fn commit_chunk_to_index(
+    embeddings: Vec<ndarray::Array2<f32>>,
+    metadata: Vec<serde_json::Value>,
+    index_path: String,
+    config: IndexConfig,
+    update_config: UpdateConfig,
+    is_full_rebuild: bool,
+) -> Result<()> {
+    let _guard = CriticalSectionGuard::new();
+
+    // STEP 1: Update vector index
+    let (_, doc_ids) =
+        MmapIndex::update_or_create(&embeddings, &index_path, &config, &update_config)?;
+
+    // STEP 2: Update filtering DB
+    let db_result = if is_full_rebuild && !filtering::exists(&index_path) {
+        filtering::create(&index_path, &metadata, &doc_ids)
+    } else {
+        filtering::update(&index_path, &metadata, &doc_ids)
+    };
+
+    if let Err(e) = db_result {
+        // ROLLBACK: Remove docs we just added to index
+        if let Err(rollback_err) = delete_from_index(&doc_ids, &index_path) {
+            eprintln!("⚠️  Rollback failed: {}", rollback_err);
+        }
+        return Err(e.into());
+    }
+
+    // STEP 3: Index metadata into FTS5 for hybrid keyword search
+    if let Err(e) = next_plaid::text_search::index(
+        &index_path,
+        &metadata,
+        &doc_ids,
+        &next_plaid::FtsTokenizer::Trigram,
+    ) {
+        eprintln!("⚠️  FTS indexing failed (non-fatal): {}", e);
+    }
+
+    Ok(())
+}
+
+/// Wait for a previous background index update to complete, propagating errors.
+fn wait_for_pending_update(handle: Option<std::thread::JoinHandle<Result<()>>>) -> Result<()> {
+    if let Some(h) = handle {
+        match h.join() {
+            Ok(result) => result?,
+            Err(panic_payload) => {
+                anyhow::bail!("Index update thread panicked: {:?}", panic_payload);
+            }
+        }
+    }
+    Ok(())
+}
 
 pub struct IndexBuilder {
     /// The model is lazily created only when needed for encoding
@@ -876,8 +933,9 @@ impl IndexBuilder {
             .sum();
         let mut eta = EtaEstimator::new(total_chars);
         let mut was_interrupted = false;
+        let mut pending_update: Option<std::thread::JoinHandle<Result<()>>> = None;
 
-        for (chunk_idx, unit_chunk) in new_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
+        for (chunk_idx, unit_chunk) in new_units.chunks(PIPELINE_CHUNK_SIZE).enumerate() {
             let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
@@ -898,7 +956,7 @@ impl IndexBuilder {
                 eta.record_batch(batch_chars, batch_start.elapsed());
                 chunk_embeddings.extend(batch_embeddings);
 
-                let progress = chunk_idx * INDEX_CHUNK_SIZE + chunk_embeddings.len();
+                let progress = chunk_idx * PIPELINE_CHUNK_SIZE + chunk_embeddings.len();
                 pb.set_position(progress.min(new_units.len()) as u64);
                 pb.set_message(eta.eta_message());
             }
@@ -908,50 +966,26 @@ impl IndexBuilder {
                 break;
             }
 
-            // Write this chunk to the index (protected by critical section)
-            // Interrupts are deferred during index writes to ensure data consistency
-            {
-                let _guard = CriticalSectionGuard::new();
+            // Wait for previous index update before starting a new one
+            wait_for_pending_update(pending_update.take())?;
 
-                // STEP 1: Update vector index first
-                let (_, doc_ids) = MmapIndex::update_or_create(
-                    &chunk_embeddings,
-                    index_path_str,
-                    &config,
-                    &update_config,
-                )?;
+            // Prepare owned data for background thread
+            let metadata: Vec<serde_json::Value> = unit_chunk
+                .iter()
+                .map(|u| serde_json::to_value(u).unwrap())
+                .collect();
+            let idx_path = index_path_str.to_string();
+            let cfg = config.clone();
+            let ucfg = update_config.clone();
 
-                // STEP 2: Update filtering DB with the actual doc_ids
-                let metadata: Vec<serde_json::Value> = unit_chunk
-                    .iter()
-                    .map(|u| serde_json::to_value(u).unwrap())
-                    .collect();
-
-                let db_result = if filtering::exists(index_path_str) {
-                    filtering::update(index_path_str, &metadata, &doc_ids)
-                } else {
-                    filtering::create(index_path_str, &metadata, &doc_ids)
-                };
-
-                if let Err(e) = db_result {
-                    // ROLLBACK: Remove docs we just added to index
-                    if let Err(rollback_err) = delete_from_index(&doc_ids, index_path_str) {
-                        eprintln!("⚠️  Rollback failed: {}", rollback_err);
-                    }
-                    return Err(e.into());
-                }
-
-                // STEP 3: Index metadata into FTS5 for hybrid keyword search
-                if let Err(e) = next_plaid::text_search::index(
-                    index_path_str,
-                    &metadata,
-                    &doc_ids,
-                    &next_plaid::FtsTokenizer::Trigram,
-                ) {
-                    eprintln!("⚠️  FTS indexing failed (non-fatal): {}", e);
-                }
-            }
+            // Spawn background index update — encoding continues on main thread
+            pending_update = Some(std::thread::spawn(move || {
+                commit_chunk_to_index(chunk_embeddings, metadata, idx_path, cfg, ucfg, true)
+            }));
         }
+
+        // Wait for final index update to complete
+        wait_for_pending_update(pending_update.take())?;
 
         pb.finish_and_clear();
 
@@ -1389,7 +1423,9 @@ impl IndexBuilder {
                 .sum();
             let mut eta = EtaEstimator::new(total_chars);
 
-            for (chunk_idx, unit_chunk) in new_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
+            let mut pending_update: Option<std::thread::JoinHandle<Result<()>>> = None;
+
+            for (chunk_idx, unit_chunk) in new_units.chunks(PIPELINE_CHUNK_SIZE).enumerate() {
                 let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
@@ -1410,7 +1446,7 @@ impl IndexBuilder {
                     eta.record_batch(batch_chars, batch_start.elapsed());
                     chunk_embeddings.extend(batch_embeddings);
 
-                    let progress = chunk_idx * INDEX_CHUNK_SIZE + chunk_embeddings.len();
+                    let progress = chunk_idx * PIPELINE_CHUNK_SIZE + chunk_embeddings.len();
                     pb.set_position(progress.min(new_units.len()) as u64);
                     pb.set_message(eta.eta_message());
                 }
@@ -1420,44 +1456,26 @@ impl IndexBuilder {
                     break;
                 }
 
-                // Write this chunk to the index (protected by critical section)
-                // Interrupts are deferred during index writes to ensure data consistency
-                {
-                    let _guard = CriticalSectionGuard::new();
+                // Wait for previous index update before starting a new one
+                wait_for_pending_update(pending_update.take())?;
 
-                    // STEP 1: Update vector index first
-                    let (_, doc_ids) = MmapIndex::update_or_create(
-                        &chunk_embeddings,
-                        index_path_str,
-                        &config,
-                        &update_config,
-                    )?;
+                // Prepare owned data for background thread
+                let metadata: Vec<serde_json::Value> = unit_chunk
+                    .iter()
+                    .map(|u| serde_json::to_value(u).unwrap())
+                    .collect();
+                let idx_path = index_path_str.to_string();
+                let cfg = config.clone();
+                let ucfg = update_config.clone();
 
-                    // STEP 2: Update filtering DB with the actual doc_ids
-                    let metadata: Vec<serde_json::Value> = unit_chunk
-                        .iter()
-                        .map(|u| serde_json::to_value(u).unwrap())
-                        .collect();
-
-                    if let Err(e) = filtering::update(index_path_str, &metadata, &doc_ids) {
-                        // ROLLBACK: Remove docs we just added to index
-                        if let Err(rollback_err) = delete_from_index(&doc_ids, index_path_str) {
-                            eprintln!("⚠️  Rollback failed: {}", rollback_err);
-                        }
-                        return Err(e.into());
-                    }
-
-                    // STEP 3: Index metadata into FTS5 for hybrid keyword search
-                    if let Err(e) = next_plaid::text_search::index(
-                        index_path_str,
-                        &metadata,
-                        &doc_ids,
-                        &next_plaid::FtsTokenizer::Trigram,
-                    ) {
-                        eprintln!("⚠️  FTS indexing failed (non-fatal): {}", e);
-                    }
-                }
+                // Spawn background index update — encoding continues on main thread
+                pending_update = Some(std::thread::spawn(move || {
+                    commit_chunk_to_index(chunk_embeddings, metadata, idx_path, cfg, ucfg, false)
+                }));
             }
+
+            // Wait for final index update to complete
+            wait_for_pending_update(pending_update.take())?;
 
             pb.finish_and_clear();
         }
@@ -1933,7 +1951,9 @@ impl IndexBuilder {
         let mut eta = EtaEstimator::new(total_chars);
         let mut was_interrupted = false;
 
-        for (chunk_idx, unit_chunk) in sorted_units.chunks(INDEX_CHUNK_SIZE).enumerate() {
+        let mut pending_update: Option<std::thread::JoinHandle<Result<()>>> = None;
+
+        for (chunk_idx, unit_chunk) in sorted_units.chunks(PIPELINE_CHUNK_SIZE).enumerate() {
             // Build embedding text for this chunk
             let texts: Vec<String> = unit_chunk.iter().map(build_embedding_text).collect();
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -1957,7 +1977,7 @@ impl IndexBuilder {
                 chunk_embeddings.extend(batch_embeddings);
 
                 if let Some(ref pb) = pb {
-                    let progress = chunk_idx * INDEX_CHUNK_SIZE + chunk_embeddings.len();
+                    let progress = chunk_idx * PIPELINE_CHUNK_SIZE + chunk_embeddings.len();
                     pb.set_position(progress.min(sorted_units.len()) as u64);
                     pb.set_message(eta.eta_message());
                 }
@@ -1968,50 +1988,26 @@ impl IndexBuilder {
                 break;
             }
 
-            // Write this chunk to the index (protected by critical section)
-            // Interrupts are deferred during index writes to ensure data consistency
-            {
-                let _guard = CriticalSectionGuard::new();
+            // Wait for previous index update before starting a new one
+            wait_for_pending_update(pending_update.take())?;
 
-                // STEP 1: Update vector index first
-                let (_, doc_ids) = MmapIndex::update_or_create(
-                    &chunk_embeddings,
-                    index_path_str,
-                    &config,
-                    &update_config,
-                )?;
+            // Prepare owned data for background thread
+            let metadata: Vec<serde_json::Value> = unit_chunk
+                .iter()
+                .map(|u| serde_json::to_value(u).unwrap())
+                .collect();
+            let idx_path = index_path_str.to_string();
+            let cfg = config.clone();
+            let ucfg = update_config.clone();
 
-                // STEP 2: Update filtering DB with the actual doc_ids
-                let metadata: Vec<serde_json::Value> = unit_chunk
-                    .iter()
-                    .map(|u| serde_json::to_value(u).unwrap())
-                    .collect();
-
-                let db_result = if filtering::exists(index_path_str) {
-                    filtering::update(index_path_str, &metadata, &doc_ids)
-                } else {
-                    filtering::create(index_path_str, &metadata, &doc_ids)
-                };
-
-                if let Err(e) = db_result {
-                    // ROLLBACK: Remove docs we just added to index
-                    if let Err(rollback_err) = delete_from_index(&doc_ids, index_path_str) {
-                        eprintln!("⚠️  Rollback failed: {}", rollback_err);
-                    }
-                    return Err(e.into());
-                }
-
-                // STEP 3: Index metadata into FTS5 for hybrid keyword search
-                if let Err(e) = next_plaid::text_search::index(
-                    index_path_str,
-                    &metadata,
-                    &doc_ids,
-                    &next_plaid::FtsTokenizer::Trigram,
-                ) {
-                    eprintln!("⚠️  FTS indexing failed (non-fatal): {}", e);
-                }
-            }
+            // Spawn background index update — encoding continues on main thread
+            pending_update = Some(std::thread::spawn(move || {
+                commit_chunk_to_index(chunk_embeddings, metadata, idx_path, cfg, ucfg, true)
+            }));
         }
+
+        // Wait for final index update to complete
+        wait_for_pending_update(pending_update.take())?;
 
         if let Some(pb) = pb {
             pb.finish_and_clear();
