@@ -1284,12 +1284,13 @@ pub fn merge_codes_chunks(
     let metadata_json_path = index_path.join("metadata.json");
     let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
     if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
+        let mtime_matches = manifest.metadata_mtime > 0.0
+            && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001;
         if manifest.num_chunks == num_chunks
             && manifest.padding_rows == padding_rows
             && manifest.chunks.len() == num_chunks
             && manifest.total_rows > 0
-            && manifest.metadata_mtime > 0.0
-            && manifest.metadata_mtime == current_metadata_mtime
+            && mtime_matches
             && merged_path.exists()
         {
             if let Ok(meta) = std::fs::metadata(&merged_path) {
@@ -1506,7 +1507,7 @@ pub fn merge_residuals_chunks(
             && manifest.total_rows > 0
             && manifest.ncols > 0
             && manifest.metadata_mtime > 0.0
-            && manifest.metadata_mtime == current_metadata_mtime
+            && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001
             && merged_path.exists()
         {
             if let Ok(meta) = std::fs::metadata(&merged_path) {
