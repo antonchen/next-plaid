@@ -377,6 +377,46 @@ jobs:
           ../target/release/colgrep "handle error" -k 5
           echo "Re-indexing test completed"
 
+      - name: Test search output uses relative paths
+        shell: bash
+        run: |
+          echo "=== Testing search output uses relative paths ==="
+          cd test_project
+
+          # Capture display output only (stderr has status lines)
+          OUTPUT=$(../target/release/colgrep "user authentication" -k 5 2>/dev/null)
+
+          echo "Output:"
+          echo "$OUTPUT"
+
+          # Every non-empty line should be a relative path (no leading / or drive letter)
+          if echo "$OUTPUT" | grep -qE '^(/|[A-Z]:\\)'; then
+            echo "FAIL: Output contains absolute paths"
+            echo "$OUTPUT" | grep -E '^(/|[A-Z]:\\)'
+            exit 1
+          fi
+          echo "Relative path test passed"
+
+      - name: Test Windows paths have no verbatim prefix
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "=== Testing Windows path output has no verbatim \\?\ prefix ==="
+          cd test_project
+
+          # Run search and capture stdout (display output only, not stderr status lines)
+          $output = & ../target/release/colgrep "user authentication" -k 5 2>$null | Out-String
+
+          echo "Output:"
+          echo $output
+
+          # Verify no verbatim path prefix in display output
+          if ($output -match '\\\\\?\\') {
+            echo "FAIL: Display output contains verbatim path prefix \\?\"
+            exit 1
+          }
+          echo "Windows verbatim path test passed: no \\?\ prefix in display output"
+
       - name: Run CLI unit tests
         working-directory: colgrep
         run: cargo test
