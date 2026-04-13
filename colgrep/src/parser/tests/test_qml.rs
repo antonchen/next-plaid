@@ -98,3 +98,42 @@ Singleton {
     let toggle_text = build_embedding_text(toggle_mute);
     assert!(toggle_text.contains("Method: toggleMute"));
 }
+
+#[test]
+fn test_extract_handler_binding_as_method() {
+    let source = r#"import Quickshell
+
+Timer {
+    onTriggered: {
+        root.syncPopout();
+    }
+}"#;
+
+    let units = parse(source, Language::Qml, "test.qml");
+
+    let handler = get_unit_by_name(&units, "onTriggered").unwrap();
+    assert_eq!(handler.unit_type, UnitType::Method);
+    assert_eq!(handler.parent_class.as_deref(), Some("Timer"));
+    let handler_text = build_embedding_text(handler);
+    assert!(handler_text.contains("Method: onTriggered"));
+    assert!(handler_text.contains("root.syncPopout()"));
+}
+
+#[test]
+fn test_extract_grouped_binding_notation_as_nested_object() {
+    let source = r#"import QtQuick
+
+Button {
+    icon {
+        source: "foo.png"
+        color: "transparent"
+    }
+}"#;
+
+    let units = parse(source, Language::Qml, "test.qml");
+
+    let icon = get_unit_by_name(&units, "icon").unwrap();
+    assert_eq!(icon.unit_type, UnitType::Class);
+    assert_eq!(icon.parent_class.as_deref(), Some("Button"));
+    assert!(icon.code.contains("source: \"foo.png\""));
+}
