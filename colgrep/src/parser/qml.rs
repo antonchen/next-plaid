@@ -176,6 +176,12 @@ fn extract_from_node(
             }
             return;
         }
+        "ui_binding" => {
+            if let Some(unit) = extract_handler_binding(node, path, lines, bytes, parent_object) {
+                units.push(unit);
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -355,6 +361,44 @@ fn extract_property(
     Some(unit)
 }
 
+fn extract_handler_binding(
+    node: Node,
+    path: &Path,
+    lines: &[&str],
+    bytes: &[u8],
+    parent_object: Option<&str>,
+) -> Option<CodeUnit> {
+    let name = field_text(node, "name", bytes)?;
+    if !looks_like_signal_handler(&name) {
+        return None;
+    }
+
+    let code = node_text(node, bytes)?;
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+
+    let mut unit = CodeUnit::new(
+        name,
+        path.to_path_buf(),
+        start_line,
+        end_line,
+        Language::Qml,
+        if parent_object.is_some() {
+            UnitType::Method
+        } else {
+            UnitType::Function
+        },
+        parent_object,
+    );
+    unit.signature = lines
+        .get(node.start_position().row)
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default();
+    unit.code = code;
+
+    Some(unit)
+}
+
 fn extract_signal_parameters(node: Node, bytes: &[u8]) -> Vec<String> {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return Vec::new();
@@ -479,6 +523,13 @@ fn is_simple_identifier(text: &str) -> bool {
     }
 
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn looks_like_signal_handler(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('o'))
+        && matches!(chars.next(), Some('n'))
+        && matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
