@@ -432,14 +432,15 @@ fn extract_object_variables(node: Node, bytes: &[u8]) -> Vec<String> {
                     push_unique(&mut variables, name);
                 }
             }
-            "ui_binding" => {
-                if field_text(child, "name", bytes).as_deref() == Some("id") {
-                    if let Some(value) = child.child_by_field_name("value").and_then(|value| {
-                        value.utf8_text(bytes).ok().map(|text| text.trim().to_string())
-                    }) {
-                        if is_simple_identifier(&value) {
-                            push_unique(&mut variables, value);
-                        }
+            "ui_binding" if field_text(child, "name", bytes).as_deref() == Some("id") => {
+                if let Some(value) = child.child_by_field_name("value").and_then(|value| {
+                    value
+                        .utf8_text(bytes)
+                        .ok()
+                        .map(|text| text.trim().to_string())
+                }) {
+                    if is_simple_identifier(&value) {
+                        push_unique(&mut variables, value);
                     }
                 }
             }
@@ -497,7 +498,12 @@ fn imports_used_in_code(imports: &[String], code: &str) -> Vec<String> {
 
 fn field_text(node: Node, field: &str, bytes: &[u8]) -> Option<String> {
     node.child_by_field_name(field)
-        .and_then(|child| child.utf8_text(bytes).ok().map(|text| text.trim().to_string()))
+        .and_then(|child| {
+            child
+                .utf8_text(bytes)
+                .ok()
+                .map(|text| text.trim().to_string())
+        })
         .filter(|text| !text.is_empty())
 }
 
