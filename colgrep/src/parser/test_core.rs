@@ -431,7 +431,7 @@ fn test_is_text_format_false() {
 // ==================== extract_units tests ====================
 
 #[test]
-fn test_extract_qml_as_document() {
+fn test_extract_qml_root_object() {
     let source = r#"import Quickshell
 
 PanelWindow {
@@ -440,9 +440,10 @@ PanelWindow {
     let units = extract_units(Path::new("shell.qml"), source, Language::Qml);
 
     assert_eq!(units.len(), 1);
+    assert_eq!(units[0].name, "PanelWindow");
     assert_eq!(units[0].language, Language::Qml);
-    assert_eq!(units[0].unit_type, UnitType::Document);
-    assert_eq!(units[0].line, 1);
+    assert_eq!(units[0].unit_type, UnitType::Class);
+    assert_eq!(units[0].line, 3);
     assert_eq!(units[0].end_line, 5);
 }
 

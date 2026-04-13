@@ -23,7 +23,10 @@ PanelWindow {
 
     let root = get_unit_by_name(&units, "PanelWindow").unwrap();
     assert_eq!(root.unit_type, UnitType::Class);
-    assert_eq!(root.variables, vec!["root".to_string(), "shell".to_string(), "count".to_string()]);
+    assert_eq!(
+        root.variables,
+        vec!["root".to_string(), "shell".to_string(), "count".to_string()]
+    );
     let root_text = build_embedding_text(root);
     assert!(root_text.contains("Class: PanelWindow"));
     assert!(root_text.contains("Code:\nPanelWindow {"));
