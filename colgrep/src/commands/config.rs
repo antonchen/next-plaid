@@ -1,9 +1,23 @@
 use anyhow::Result;
 
 use colgrep::{
-    ensure_model, ensure_onnx_runtime, get_colgrep_data_dir, Config, DEFAULT_BATCH_SIZE,
-    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MODEL, DEFAULT_POOL_FACTOR,
+    ensure_model, ensure_onnx_runtime, get_colgrep_data_dir, Config, DEFAULT_MAX_RECURSION_DEPTH,
+    DEFAULT_MODEL, DEFAULT_POOL_FACTOR,
 };
+
+fn format_parallel_setting(config: &Config) -> String {
+    config
+        .configured_parallel_sessions()
+        .map(|sessions| sessions.to_string())
+        .unwrap_or_else(|| "auto (runtime-resolved)".to_string())
+}
+
+fn format_batch_size_setting(config: &Config) -> String {
+    config
+        .configured_batch_size()
+        .map(|batch_size| batch_size.to_string())
+        .unwrap_or_else(|| "auto (runtime-resolved)".to_string())
+}
 
 pub fn cmd_set_model(model: &str) -> Result<()> {
     use next_plaid_onnx::Colbert;
@@ -170,21 +184,9 @@ pub fn cmd_config(
             println!("  pool-factor: {} (default)", DEFAULT_POOL_FACTOR);
         }
 
-        // Parallel sessions
-        let ps = config.get_parallel_sessions();
-        if config.parallel_sessions.is_some() {
-            println!("  parallel:    {}", ps);
-        } else {
-            println!("  parallel:    {} (auto, {} cpus)", ps, ps);
-        }
+        println!("  parallel:    {}", format_parallel_setting(&config));
 
-        // Batch size
-        let bs = config.get_batch_size();
-        if config.batch_size.is_some() {
-            println!("  batch-size:  {}", bs);
-        } else {
-            println!("  batch-size:  {} (default)", DEFAULT_BATCH_SIZE);
-        }
+        println!("  batch-size:  {}", format_batch_size_setting(&config));
 
         // k
         match config.get_default_k() {
@@ -332,8 +334,7 @@ pub fn cmd_config(
     if let Some(ps) = parallel_sessions {
         if ps == 0 {
             config.clear_parallel_sessions();
-            let auto_ps = config.get_parallel_sessions();
-            println!("✅ Reset parallel sessions to auto ({} cpus)", auto_ps);
+            println!("✅ Reset parallel sessions to auto (runtime-resolved)");
         } else {
             config.set_parallel_sessions(ps);
             println!("✅ Set parallel sessions to {}", ps);
@@ -345,7 +346,7 @@ pub fn cmd_config(
     if let Some(bs) = batch_size {
         if bs == 0 {
             config.clear_batch_size();
-            println!("✅ Reset batch size to {} (default)", DEFAULT_BATCH_SIZE);
+            println!("✅ Reset batch size to auto (runtime-resolved)");
         } else {
             config.set_batch_size(bs);
             println!("✅ Set batch size to {}", bs);
@@ -458,4 +459,46 @@ pub fn cmd_config(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_parallel_setting_explicit() {
+        let config = Config {
+            parallel_sessions: Some(4),
+            ..Default::default()
+        };
+
+        assert_eq!(format_parallel_setting(&config), "4");
+    }
+
+    #[test]
+    fn test_format_parallel_setting_auto() {
+        let config = Config::default();
+
+        assert_eq!(format_parallel_setting(&config), "auto (runtime-resolved)");
+    }
+
+    #[test]
+    fn test_format_batch_size_setting_explicit() {
+        let config = Config {
+            batch_size: Some(8),
+            ..Default::default()
+        };
+
+        assert_eq!(format_batch_size_setting(&config), "8");
+    }
+
+    #[test]
+    fn test_format_batch_size_setting_auto() {
+        let config = Config::default();
+
+        assert_eq!(
+            format_batch_size_setting(&config),
+            "auto (runtime-resolved)"
+        );
+    }
 }

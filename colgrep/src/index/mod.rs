@@ -779,12 +779,8 @@ impl IndexBuilder {
                             .context("Failed to initialize ONNX Runtime")?;
 
                         (
-                            self.parallel_sessions.unwrap_or_else(|| {
-                                let cpu_count = std::thread::available_parallelism()
-                                    .map(|p| p.get())
-                                    .unwrap_or(8);
-                                cpu_count.min(crate::config::MAX_PARALLEL_SESSIONS_CPU)
-                            }),
+                            self.parallel_sessions
+                                .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions),
                             ExecutionProvider::Cpu,
                         )
                     }
@@ -833,12 +829,9 @@ impl IndexBuilder {
                             )
                         } else {
                             (
-                                self.parallel_sessions.unwrap_or_else(|| {
-                                    let cpu_count = std::thread::available_parallelism()
-                                        .map(|p| p.get())
-                                        .unwrap_or(8);
-                                    cpu_count.min(crate::config::MAX_PARALLEL_SESSIONS_CPU)
-                                }),
+                                self.parallel_sessions.unwrap_or_else(
+                                    crate::config::get_default_cpu_parallel_sessions,
+                                ),
                                 ExecutionProvider::Cpu,
                             )
                         }
@@ -854,12 +847,8 @@ impl IndexBuilder {
                     .context("Failed to initialize ONNX Runtime")?;
 
                 (
-                    self.parallel_sessions.unwrap_or_else(|| {
-                        let cpu_count = std::thread::available_parallelism()
-                            .map(|p| p.get())
-                            .unwrap_or(8);
-                        cpu_count.min(crate::config::MAX_PARALLEL_SESSIONS_CPU)
-                    }),
+                    self.parallel_sessions
+                        .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions),
                     ExecutionProvider::Cpu,
                 )
             };
@@ -922,12 +911,9 @@ impl IndexBuilder {
         self.model = None;
         apply_acceleration_mode(AccelerationMode::ForceCpu);
 
-        let num_sessions = self.parallel_sessions.unwrap_or_else(|| {
-            let cpu_count = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(8);
-            cpu_count.min(crate::config::MAX_PARALLEL_SESSIONS_CPU)
-        });
+        let num_sessions = self
+            .parallel_sessions
+            .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions);
         let batch = crate::config::DEFAULT_BATCH_SIZE_CPU;
 
         let model = crate::stderr::with_suppressed_stderr(|| {

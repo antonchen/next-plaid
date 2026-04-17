@@ -56,26 +56,25 @@ pub fn get_default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE_CPU
 }
 
+pub fn get_default_cpu_parallel_sessions() -> usize {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(16);
+    cpu_count.min(MAX_PARALLEL_SESSIONS_CPU)
+}
+
 /// Get the effective default parallel sessions at runtime.
 /// When CUDA feature is enabled but cuDNN is not available, returns CPU default.
 #[cfg(feature = "cuda")]
 pub fn get_default_parallel_sessions() -> usize {
     match env_acceleration_mode_lossy() {
-        AccelerationMode::ForceCpu => {
-            let cpu_count = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(16);
-            cpu_count.min(MAX_PARALLEL_SESSIONS_CPU)
-        }
+        AccelerationMode::ForceCpu => get_default_cpu_parallel_sessions(),
         AccelerationMode::ForceGpu => DEFAULT_PARALLEL_SESSIONS_GPU,
         AccelerationMode::Auto => {
             if crate::onnx_runtime::is_cudnn_available() {
                 DEFAULT_PARALLEL_SESSIONS_GPU
             } else {
-                let cpu_count = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(16);
-                cpu_count.min(MAX_PARALLEL_SESSIONS_CPU)
+                get_default_cpu_parallel_sessions()
             }
         }
     }
@@ -83,10 +82,7 @@ pub fn get_default_parallel_sessions() -> usize {
 
 #[cfg(not(feature = "cuda"))]
 pub fn get_default_parallel_sessions() -> usize {
-    let cpu_count = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(16);
-    cpu_count.min(MAX_PARALLEL_SESSIONS_CPU)
+    get_default_cpu_parallel_sessions()
 }
 
 /// Default number of parallel sessions for GPU (CUDA)
@@ -291,12 +287,18 @@ impl Config {
         self.pool_factor = None;
     }
 
+    /// Get the user-configured parallel session override, if any
+    /// Returns None when config is in auto mode so runtime-aware defaults can be resolved later
+    pub fn configured_parallel_sessions(&self) -> Option<usize> {
+        self.parallel_sessions.map(|sessions| sessions.max(1))
+    }
+
     /// Get the number of parallel sessions for encoding
     /// Returns the configured value or:
     /// - 1 session when CUDA is enabled AND cuDNN is available (GPUs work best with single session + large batches)
-    /// - min(CPU count, 8) otherwise (CPUs benefit from parallel sessions)
+    /// - min(CPU count, 16) otherwise (CPUs benefit from parallel sessions)
     pub fn get_parallel_sessions(&self) -> usize {
-        self.parallel_sessions
+        self.configured_parallel_sessions()
             .unwrap_or_else(get_default_parallel_sessions)
     }
 
@@ -310,12 +312,19 @@ impl Config {
         self.parallel_sessions = None;
     }
 
+    /// Get the user-configured batch size override, if any
+    /// Returns None when config is in auto mode so runtime-aware defaults can be resolved later
+    pub fn configured_batch_size(&self) -> Option<usize> {
+        self.batch_size.map(|size| size.max(1))
+    }
+
     /// Get the batch size for encoding
     /// Returns the configured value or the runtime default:
     /// - 64 when CUDA is enabled AND cuDNN is available
     /// - 1 otherwise (CPU mode)
     pub fn get_batch_size(&self) -> usize {
-        self.batch_size.unwrap_or_else(get_default_batch_size)
+        self.configured_batch_size()
+            .unwrap_or_else(get_default_batch_size)
     }
 
     /// Set the batch size for encoding
@@ -669,6 +678,32 @@ mod tests {
         // Should be min(cpu_count, 16)
         assert!(sessions >= 1);
         assert!(sessions <= 16);
+    }
+
+    #[test]
+    fn test_config_auto_getters_resolve_to_concrete_values() {
+        let config = Config::default();
+
+        assert!(config.parallel_sessions.is_none());
+        assert!(config.batch_size.is_none());
+        assert!(config.configured_parallel_sessions().is_none());
+        assert!(config.configured_batch_size().is_none());
+        assert!(config.get_parallel_sessions() >= 1);
+        assert!(config.get_batch_size() >= 1);
+    }
+
+    #[test]
+    fn test_config_configured_runtime_overrides_normalize_legacy_zero_values() {
+        let config = Config {
+            parallel_sessions: Some(0),
+            batch_size: Some(0),
+            ..Default::default()
+        };
+
+        assert_eq!(config.configured_parallel_sessions(), Some(1));
+        assert_eq!(config.configured_batch_size(), Some(1));
+        assert_eq!(config.get_parallel_sessions(), 1);
+        assert_eq!(config.get_batch_size(), 1);
     }
 
     #[test]

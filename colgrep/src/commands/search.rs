@@ -920,9 +920,8 @@ fn search_single_path(
     // Resolve quantized setting from config (default: false = use FP32)
     let quantized = !config.use_fp32();
 
-    // Resolve parallel sessions and batch size from config
-    let parallel_sessions = Some(config.get_parallel_sessions());
-    let batch_size = Some(config.get_batch_size());
+    let parallel_sessions = config.configured_parallel_sessions();
+    let batch_size = config.configured_batch_size();
 
     // Check if index already exists (suppress model output if so)
     let has_existing_index =
