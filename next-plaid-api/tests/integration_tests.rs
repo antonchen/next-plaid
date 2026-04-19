@@ -2,10 +2,12 @@
 //!
 //! These tests create real indices and test all API endpoints.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
     routing::{get, post, put},
     Json, Router,
@@ -15,15 +17,20 @@ use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    timeout::TimeoutLayer,
+};
 
 // Import from the API crate
 use next_plaid_api::{
     handlers,
     models::{
         CheckMetadataResponse, CreateIndexResponse, GetMetadataResponse, IndexInfoResponse,
+        ProjectSyncCreateJobResponse, ProjectSyncJobResponse, ProjectSyncJobStatus,
         QueryMetadataResponse, RerankResponse, SearchResponse,
     },
     state::{ApiConfig, AppState},
@@ -41,6 +48,10 @@ struct TestFixture {
 impl TestFixture {
     /// Create a new test fixture with a temporary index directory.
     async fn new() -> Self {
+        Self::new_with_project_sync_timeout(Duration::from_secs(300)).await
+    }
+
+    async fn new_with_project_sync_timeout(project_sync_timeout: Duration) -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         let config = ApiConfig {
@@ -54,7 +65,7 @@ impl TestFixture {
         let state = Arc::new(AppState::new(config));
 
         // Build router
-        let app = build_test_router(state);
+        let app = build_test_router_with_project_sync_timeout(state, project_sync_timeout);
 
         // Find available port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -172,6 +183,123 @@ impl TestFixture {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    async fn wait_for_project_sync_terminal_status(
+        &self,
+        job_id: &str,
+        max_wait_ms: u64,
+    ) -> ProjectSyncJobResponse {
+        let start = std::time::Instant::now();
+        loop {
+            let resp = self
+                .client
+                .get(self.url(&format!("/project_sync/jobs/{}", job_id)))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(job) = resp.json::<ProjectSyncJobResponse>().await {
+                        if job.status == ProjectSyncJobStatus::Completed
+                            || job.status == ProjectSyncJobStatus::Failed
+                            || job.status == ProjectSyncJobStatus::Cancelled
+                            || job.status == ProjectSyncJobStatus::Expired
+                        {
+                            return job;
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed().as_millis() as u64 > max_wait_ms {
+                panic!(
+                    "Timeout waiting for project_sync job '{}' to reach terminal state",
+                    job_id
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn wait_for_project_sync_status(
+        &self,
+        job_id: &str,
+        expected_status: ProjectSyncJobStatus,
+        max_wait_ms: u64,
+    ) -> ProjectSyncJobResponse {
+        let start = std::time::Instant::now();
+        loop {
+            let resp = self
+                .client
+                .get(self.url(&format!("/project_sync/jobs/{}", job_id)))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(job) = resp.json::<ProjectSyncJobResponse>().await {
+                        if job.status == expected_status {
+                            return job;
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed().as_millis() as u64 > max_wait_ms {
+                panic!(
+                    "Timeout waiting for project_sync job '{}' to reach status {:?}",
+                    job_id, expected_status
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn open_raw_http_connection(&self) -> TcpStream {
+        let url = reqwest::Url::parse(&self.base_url).expect("base URL should be valid");
+        let host = url.host_str().expect("base URL should include host");
+        let port = url
+            .port_or_known_default()
+            .expect("base URL should include port");
+        TcpStream::connect((host, port))
+            .await
+            .expect("raw TCP connection should open")
+    }
+
+    fn raw_http_authority(&self) -> String {
+        let url = reqwest::Url::parse(&self.base_url).expect("base URL should be valid");
+        let host = url.host_str().expect("base URL should include host");
+        let port = url
+            .port_or_known_default()
+            .expect("base URL should include port");
+        format!("{}:{}", host, port)
+    }
+
+    fn project_sync_job_dir(&self, job_id: &str) -> PathBuf {
+        self._temp_dir
+            .path()
+            .join("_project_sync_jobs")
+            .join(job_id)
+    }
+
+    async fn read_project_sync_manifest(&self, job_id: &str) -> Value {
+        let path = self.project_sync_job_dir(job_id).join("manifest.json");
+        let bytes = tokio::fs::read(path)
+            .await
+            .expect("project_sync manifest should exist");
+        serde_json::from_slice(&bytes).expect("project_sync manifest should deserialize")
+    }
+
+    async fn write_project_sync_manifest(&self, job_id: &str, manifest: &Value) {
+        let manifest_bytes =
+            serde_json::to_vec_pretty(manifest).expect("project_sync manifest should serialize");
+        tokio::fs::write(
+            self.project_sync_job_dir(job_id).join("manifest.json"),
+            manifest_bytes,
+        )
+        .await
+        .expect("project_sync manifest should persist");
     }
 
     /// Helper to create and populate an index in one step.
@@ -373,8 +501,44 @@ fn rate_limit_error(_err: tower_governor::GovernorError) -> axum::http::Response
         .unwrap()
 }
 
+const TEST_PROJECT_SYNC_MAX_INGEST_REQUEST_BYTES: usize = 100 * 1024 * 1024;
+
 /// Build the test router (same as main but without tracing).
-fn build_test_router(state: Arc<AppState>) -> Router {
+fn build_project_sync_control_test_router(project_sync_timeout: Duration) -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/indices/{name}/project_sync/jobs",
+            post(handlers::create_project_sync_job),
+        )
+        .route(
+            "/project_sync/jobs/{job_id}/finalize",
+            post(handlers::finalize_project_sync_job),
+        )
+        .route(
+            "/project_sync/jobs/{job_id}",
+            get(handlers::get_project_sync_job).delete(handlers::cancel_project_sync_job),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            project_sync_timeout,
+        ))
+}
+
+fn build_project_sync_upload_test_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/project_sync/jobs/{job_id}/upload",
+            put(handlers::upload_project_sync_job),
+        )
+        .layer(DefaultBodyLimit::max(
+            TEST_PROJECT_SYNC_MAX_INGEST_REQUEST_BYTES,
+        ))
+}
+
+fn build_test_router_with_project_sync_timeout(
+    state: Arc<AppState>,
+    project_sync_timeout: Duration,
+) -> Router {
     // Index management routes
     let index_routes = Router::new()
         .route(
@@ -429,6 +593,8 @@ fn build_test_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .nest("/indices", indices_router)
+        .merge(build_project_sync_control_test_router(project_sync_timeout))
+        .merge(build_project_sync_upload_test_router())
         .merge(rerank_route)
         .layer(
             CorsLayer::new()
@@ -515,6 +681,18 @@ fn build_rate_limited_test_router(
         // Rate limiting layer
         .layer(governor_layer)
         .with_state(state)
+}
+
+fn build_project_sync_ndjson_payload(path: &str, content: &str) -> String {
+    let record = json!({
+        "path": path,
+        "content": content,
+        "language": "rust"
+    });
+    format!(
+        "{}\n",
+        serde_json::to_string(&record).expect("project_sync record should serialize")
+    )
 }
 
 /// Test fixture for rate limiting tests with configurable rate limits.
@@ -1682,6 +1860,713 @@ async fn test_rate_limiting() {
     assert_eq!(body["status"], "healthy", "Expected healthy status");
 }
 
+#[tokio::test]
+async fn test_project_sync_create_upload_cancel_status() {
+    let fixture = TestFixture::new().await;
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": "project_sync_cancel_test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload = concat!(
+        "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\",\"language\":\"rust\",",
+        "\"metadata\":{\"module\":\"main\"}}\n"
+    )
+    .to_string();
+    let declared_bytes = payload.len() as u64;
+
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_cancel_test/project_sync/jobs"))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+    assert_eq!(create_job_body.status, ProjectSyncJobStatus::Created);
+
+    let upload_resp = fixture
+        .client
+        .put(fixture.url(&format!(
+            "/project_sync/jobs/{}/upload",
+            create_job_body.job_id
+        )))
+        .header("content-type", "application/x-ndjson")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload_resp.status(), reqwest::StatusCode::OK);
+    let upload_body: ProjectSyncJobResponse = upload_resp.json().await.unwrap();
+    assert_eq!(upload_body.status, ProjectSyncJobStatus::Uploaded);
+    assert_eq!(upload_body.uploaded_bytes, declared_bytes);
+
+    let get_resp = fixture
+        .client
+        .get(fixture.url(&format!("/project_sync/jobs/{}", create_job_body.job_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let get_body: ProjectSyncJobResponse = get_resp.json().await.unwrap();
+    assert_eq!(get_body.status, ProjectSyncJobStatus::Uploaded);
+
+    let job_dir = fixture.project_sync_job_dir(&create_job_body.job_id);
+    assert!(job_dir.join("spool.ndjson").exists());
+
+    let replay_upload_resp = fixture
+        .client
+        .put(fixture.url(&format!(
+            "/project_sync/jobs/{}/upload",
+            create_job_body.job_id
+        )))
+        .header("content-type", "application/x-ndjson")
+        .body(
+            concat!(
+                "{\"path\":\"src/other.rs\",\"content\":\"fn other() {}\",\"language\":\"rust\"}\n"
+            )
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_upload_resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(job_dir.join("spool.ndjson").exists());
+
+    let cancel_resp = fixture
+        .client
+        .delete(fixture.url(&format!("/project_sync/jobs/{}", create_job_body.job_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), reqwest::StatusCode::OK);
+    let cancel_body: ProjectSyncJobResponse = cancel_resp.json().await.unwrap();
+    assert_eq!(cancel_body.status, ProjectSyncJobStatus::Cancelled);
+    assert_eq!(cancel_body.error.as_deref(), Some("Cancelled by client"));
+
+    let cancel_again_resp = fixture
+        .client
+        .delete(fixture.url(&format!("/project_sync/jobs/{}", create_job_body.job_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel_again_resp.status(), reqwest::StatusCode::OK);
+    let cancel_again_body: ProjectSyncJobResponse = cancel_again_resp.json().await.unwrap();
+    assert_eq!(cancel_again_body.status, ProjectSyncJobStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn test_project_sync_upload_route_is_not_wrapped_by_control_timeout() {
+    let fixture = TestFixture::new_with_project_sync_timeout(Duration::from_millis(50)).await;
+    let index_name = "project_sync_upload_timeout_split_test";
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": index_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload = build_project_sync_ndjson_payload("src/main.rs", "fn main() {}\n");
+    let declared_bytes = payload.len() as u64;
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+    let split_at = payload.len() / 2;
+    let first_chunk = &payload[..split_at];
+    let second_chunk = &payload[split_at..];
+    let mut stream = fixture.open_raw_http_connection().await;
+    let request = format!(
+        concat!(
+            "PUT /project_sync/jobs/{}/upload HTTP/1.1\r\n",
+            "Host: {}\r\n",
+            "Content-Type: application/x-ndjson\r\n",
+            "Content-Length: {}\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "{}"
+        ),
+        create_job_body.job_id,
+        fixture.raw_http_authority(),
+        declared_bytes,
+        first_chunk
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    fixture
+        .wait_for_project_sync_status(
+            &create_job_body.job_id,
+            ProjectSyncJobStatus::Uploading,
+            5_000,
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stream.write_all(second_chunk.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response_bytes: Vec<u8> = Vec::new();
+    stream.read_to_end(&mut response_bytes).await.unwrap();
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    assert!(
+        response_text.starts_with("HTTP/1.1 200"),
+        "unexpected upload response: {}",
+        response_text
+    );
+
+    let uploaded_job = fixture
+        .wait_for_project_sync_status(
+            &create_job_body.job_id,
+            ProjectSyncJobStatus::Uploaded,
+            5_000,
+        )
+        .await;
+    assert_eq!(uploaded_job.uploaded_bytes, declared_bytes);
+}
+
+#[tokio::test]
+async fn test_project_sync_create_job_rejects_sha256_field() {
+    let fixture = TestFixture::new().await;
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": "project_sync_sha256_reject_test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_sha256_reject_test/project_sync/jobs"))
+        .json(&json!({
+            "declared_bytes": 10,
+            "content_type": "application/x-ndjson",
+            "sha256": "abc"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let body: Value = create_job_resp.json().await.unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("unknown field `sha256`"));
+}
+
+#[tokio::test]
+async fn test_project_sync_upload_can_be_cancelled_mid_stream() {
+    let fixture = TestFixture::new().await;
+    let index_name = "project_sync_cancel_mid_upload_test";
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": index_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let declared_bytes = 100_u64 * 1024 * 1024;
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+    let mut reserved_job_ids_count: usize = 0;
+    for _ in 0..9 {
+        let reserve_resp = fixture
+            .client
+            .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+            .json(&json!({
+                "declared_bytes": declared_bytes,
+                "content_type": "application/x-ndjson"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reserve_resp.status(), reqwest::StatusCode::OK);
+        let _: ProjectSyncCreateJobResponse = reserve_resp.json().await.unwrap();
+        reserved_job_ids_count += 1;
+    }
+    assert_eq!(reserved_job_ids_count, 9);
+
+    let mut stream = fixture.open_raw_http_connection().await;
+    let first_chunk = "a".repeat(1024);
+    let request = format!(
+        concat!(
+            "PUT /project_sync/jobs/{}/upload HTTP/1.1\r\n",
+            "Host: {}\r\n",
+            "Content-Type: application/x-ndjson\r\n",
+            "Content-Length: {}\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "{}"
+        ),
+        create_job_body.job_id,
+        fixture.raw_http_authority(),
+        declared_bytes,
+        first_chunk
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    fixture
+        .wait_for_project_sync_status(
+            &create_job_body.job_id,
+            ProjectSyncJobStatus::Uploading,
+            5_000,
+        )
+        .await;
+
+    let cancel_resp = fixture
+        .client
+        .delete(fixture.url(&format!("/project_sync/jobs/{}", create_job_body.job_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), reqwest::StatusCode::OK);
+    let cancel_body: ProjectSyncJobResponse = cancel_resp.json().await.unwrap();
+    assert_eq!(cancel_body.status, ProjectSyncJobStatus::Cancelling);
+    assert_eq!(
+        cancel_body.error.as_deref(),
+        Some("Cancellation requested by client")
+    );
+
+    stream.shutdown().await.unwrap();
+    let mut response_bytes: Vec<u8> = Vec::new();
+    stream.read_to_end(&mut response_bytes).await.unwrap();
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    assert!(
+        response_text.starts_with("HTTP/1.1 409"),
+        "unexpected upload response: {}",
+        response_text
+    );
+
+    let terminal_job = fixture
+        .wait_for_project_sync_terminal_status(&create_job_body.job_id, 10_000)
+        .await;
+    assert_eq!(terminal_job.status, ProjectSyncJobStatus::Cancelled);
+    assert_eq!(terminal_job.error.as_deref(), Some("Cancelled by client"));
+
+    let manifest = fixture
+        .read_project_sync_manifest(&create_job_body.job_id)
+        .await;
+    assert_eq!(manifest["status"], "cancelled");
+    assert_eq!(manifest["reserved_bytes"], false);
+
+    let job_dir = fixture.project_sync_job_dir(&create_job_body.job_id);
+    assert!(!job_dir.join("spool.ndjson").exists());
+    assert!(!job_dir.join("spool.ndjson.tmp").exists());
+
+    let finalize_resp = fixture
+        .client
+        .post(fixture.url(&format!(
+            "/project_sync/jobs/{}/finalize",
+            create_job_body.job_id
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finalize_resp.status(), reqwest::StatusCode::CONFLICT);
+
+    let released_capacity_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(released_capacity_resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_project_sync_finalize_reaches_terminal_status_without_model() {
+    let fixture = TestFixture::new().await;
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": "project_sync_finalize_test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload = concat!(
+        "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 42 }\",",
+        "\"language\":\"rust\",\"metadata\":{\"kind\":\"function\"}}\n"
+    )
+    .to_string();
+    let declared_bytes = payload.len() as u64;
+
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_finalize_test/project_sync/jobs"))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+    let upload_resp = fixture
+        .client
+        .put(fixture.url(&format!(
+            "/project_sync/jobs/{}/upload",
+            create_job_body.job_id
+        )))
+        .header("content-type", "application/x-ndjson")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload_resp.status(), reqwest::StatusCode::OK);
+
+    let finalize_resp = fixture
+        .client
+        .post(fixture.url(&format!(
+            "/project_sync/jobs/{}/finalize",
+            create_job_body.job_id
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finalize_resp.status(), reqwest::StatusCode::OK);
+    let finalize_body: ProjectSyncJobResponse = finalize_resp.json().await.unwrap();
+    assert_eq!(finalize_body.status, ProjectSyncJobStatus::Queued);
+
+    let terminal_job = fixture
+        .wait_for_project_sync_terminal_status(&create_job_body.job_id, 10_000)
+        .await;
+    assert_eq!(terminal_job.status, ProjectSyncJobStatus::Failed);
+    assert!(
+        terminal_job
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Model"),
+        "Expected model-related failure, got {:?}",
+        terminal_job.error
+    );
+
+    let job_dir = fixture.project_sync_job_dir(&create_job_body.job_id);
+    assert!(!job_dir.join("spool.ndjson").exists());
+    assert!(!job_dir.join("spool.ndjson.tmp").exists());
+
+    let status_resp = fixture
+        .client
+        .get(fixture.url(&format!("/project_sync/jobs/{}", create_job_body.job_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_resp.status(), reqwest::StatusCode::OK);
+    let status_body: ProjectSyncJobResponse = status_resp.json().await.unwrap();
+    assert_eq!(status_body.status, ProjectSyncJobStatus::Failed);
+}
+
+#[tokio::test]
+async fn test_project_sync_admission_limits() {
+    let fixture = TestFixture::new().await;
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": "project_sync_limits_test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let too_large_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_limits_test/project_sync/jobs"))
+        .json(&json!({
+            "declared_bytes": (100_u64 * 1024 * 1024) + 1,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        too_large_resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let too_large_body: Value = too_large_resp.json().await.unwrap();
+    assert_eq!(
+        too_large_body["details"]["max_ingest_request_bytes"],
+        100_u64 * 1024 * 1024
+    );
+
+    let mut reserved_job_ids: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let create_resp = fixture
+            .client
+            .post(fixture.url("/indices/project_sync_limits_test/project_sync/jobs"))
+            .json(&json!({
+                "declared_bytes": 100_u64 * 1024 * 1024,
+                "content_type": "application/x-ndjson"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), reqwest::StatusCode::OK);
+        let create_body: ProjectSyncCreateJobResponse = create_resp.json().await.unwrap();
+        reserved_job_ids.push(create_body.job_id);
+    }
+
+    let backlog_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_limits_test/project_sync/jobs"))
+        .json(&json!({
+            "declared_bytes": 100_u64 * 1024 * 1024,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        backlog_resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        backlog_resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .expect("retry-after header should exist"),
+        "5"
+    );
+    let backlog_body: Value = backlog_resp.json().await.unwrap();
+    assert_eq!(
+        backlog_body["details"]["required_bytes"],
+        100_u64 * 1024 * 1024
+    );
+    assert_eq!(
+        backlog_body["details"]["pending_ingest_bytes"],
+        10_u64 * 100_u64 * 1024 * 1024
+    );
+    assert_eq!(
+        backlog_body["details"]["max_pending_ingest_bytes"],
+        1024_u64 * 1024 * 1024
+    );
+    assert_eq!(backlog_body["details"]["retry_after_seconds_hint"], 5);
+
+    for job_id in reserved_job_ids {
+        let cancel_resp = fixture
+            .client
+            .delete(fixture.url(&format!("/project_sync/jobs/{}", job_id)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancel_resp.status(), reqwest::StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn test_project_sync_expired_jobs_release_pending_budget() {
+    let fixture = TestFixture::new().await;
+    let index_name = "project_sync_expiry_test";
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": index_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let declared_bytes = 100_u64 * 1024 * 1024;
+    let mut created_job_ids: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let create_resp = fixture
+            .client
+            .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+            .json(&json!({
+                "declared_bytes": declared_bytes,
+                "content_type": "application/x-ndjson"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), reqwest::StatusCode::OK);
+        let create_body: ProjectSyncCreateJobResponse = create_resp.json().await.unwrap();
+        created_job_ids.push(create_body.job_id);
+    }
+
+    let mut stale_manifest = fixture
+        .read_project_sync_manifest(&created_job_ids[0])
+        .await;
+    stale_manifest["updated_at_ms"] = json!(1_u64);
+    fixture
+        .write_project_sync_manifest(&created_job_ids[0], &stale_manifest)
+        .await;
+
+    let create_after_expiry_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_after_expiry_resp.status(), reqwest::StatusCode::OK);
+
+    let expired_manifest = fixture
+        .read_project_sync_manifest(&created_job_ids[0])
+        .await;
+    assert_eq!(expired_manifest["status"], "expired");
+    assert_eq!(expired_manifest["reserved_bytes"], false);
+}
+
+#[tokio::test]
+async fn test_project_sync_expired_upload_cannot_revive_job() {
+    let fixture = TestFixture::new().await;
+    let index_name = "project_sync_expired_upload_test";
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({ "name": index_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload = build_project_sync_ndjson_payload("src/lib.rs", "pub fn value() -> u32 { 1 }\n");
+    let declared_bytes = payload.len() as u64;
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+    let split_at = payload.len() / 2;
+    let first_chunk = &payload[..split_at];
+    let second_chunk = &payload[split_at..];
+    let mut stream = fixture.open_raw_http_connection().await;
+    let request = format!(
+        concat!(
+            "PUT /project_sync/jobs/{}/upload HTTP/1.1\r\n",
+            "Host: {}\r\n",
+            "Content-Type: application/x-ndjson\r\n",
+            "Content-Length: {}\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "{}"
+        ),
+        create_job_body.job_id,
+        fixture.raw_http_authority(),
+        declared_bytes,
+        first_chunk
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    fixture
+        .wait_for_project_sync_status(
+            &create_job_body.job_id,
+            ProjectSyncJobStatus::Uploading,
+            5_000,
+        )
+        .await;
+
+    let mut stale_manifest = fixture
+        .read_project_sync_manifest(&create_job_body.job_id)
+        .await;
+    stale_manifest["updated_at_ms"] = json!(1_u64);
+    fixture
+        .write_project_sync_manifest(&create_job_body.job_id, &stale_manifest)
+        .await;
+
+    let sweep_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sweep_resp.status(), reqwest::StatusCode::OK);
+
+    let expired_manifest = fixture
+        .read_project_sync_manifest(&create_job_body.job_id)
+        .await;
+    assert_eq!(expired_manifest["status"], "expired");
+    assert_eq!(expired_manifest["reserved_bytes"], false);
+
+    stream.write_all(second_chunk.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response_bytes: Vec<u8> = Vec::new();
+    stream.read_to_end(&mut response_bytes).await.unwrap();
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    assert!(
+        response_text.starts_with("HTTP/1.1 409"),
+        "unexpected upload response: {}",
+        response_text
+    );
+
+    let final_manifest = fixture
+        .read_project_sync_manifest(&create_job_body.job_id)
+        .await;
+    assert_eq!(final_manifest["status"], "expired");
+    assert_eq!(final_manifest["reserved_bytes"], false);
+    let job_dir = fixture.project_sync_job_dir(&create_job_body.job_id);
+    assert!(!job_dir.join("spool.ndjson").exists());
+    assert!(!job_dir.join("spool.ndjson.tmp").exists());
+}
+
 // =============================================================================
 // Model/Encoding Tests (requires "model" feature)
 // =============================================================================
@@ -1828,6 +2713,14 @@ impl ModelTestFixture {
 /// Build a test router with model-based encoding routes.
 #[cfg(feature = "model")]
 fn build_model_test_router(state: Arc<AppState>) -> Router {
+    build_model_test_router_with_project_sync_timeout(state, Duration::from_secs(300))
+}
+
+#[cfg(feature = "model")]
+fn build_model_test_router_with_project_sync_timeout(
+    state: Arc<AppState>,
+    project_sync_timeout: Duration,
+) -> Router {
     // Index management routes
     let index_routes = Router::new()
         .route(
@@ -1900,6 +2793,8 @@ fn build_model_test_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .nest("/indices", indices_router)
+        .merge(build_project_sync_control_test_router(project_sync_timeout))
+        .merge(build_project_sync_upload_test_router())
         .merge(encode_route)
         .layer(
             CorsLayer::new()
