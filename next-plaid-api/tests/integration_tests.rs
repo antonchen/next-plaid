@@ -249,6 +249,115 @@ impl TestFixture {
     }
 }
 
+#[cfg(feature = "model")]
+fn dummy_model_pool(
+    path: &str,
+    use_cuda: bool,
+    pool_size: usize,
+) -> next_plaid_api::state::ModelPool {
+    next_plaid_api::state::ModelPool {
+        pool_size,
+        model_config: next_plaid_api::state::ModelConfig {
+            path: std::path::PathBuf::from(path),
+            use_cuda,
+            use_int8: false,
+            parallel_sessions: Some(1),
+            batch_size: Some(4),
+            threads: None,
+            query_length: Some(48),
+            document_length: Some(300),
+        },
+        cached_info: next_plaid_api::state::CachedModelInfo {
+            name: Some("dummy".to_string()),
+            path: path.to_string(),
+            quantized: false,
+            embedding_dim: 48,
+            batch_size: 4,
+            num_sessions: 1,
+            query_prefix: "[Q] ".to_string(),
+            document_prefix: "[D] ".to_string(),
+            query_length: 48,
+            document_length: 300,
+            do_query_expansion: false,
+            uses_token_type_ids: false,
+            mask_token_id: 50284,
+            pad_token_id: 50284,
+        },
+    }
+}
+
+#[cfg(feature = "model")]
+#[test]
+fn query_on_cpu_routes_logical_lanes_to_distinct_pools() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config = ApiConfig {
+        index_dir: temp_dir.path().to_path_buf(),
+        default_top_k: 10,
+    };
+
+    let state = AppState::with_dual_model_pools(
+        config,
+        dummy_model_pool("/models/ingest", true, 2),
+        dummy_model_pool("/models/query", false, 1),
+        None,
+    );
+
+    assert_eq!(
+        state.encode_pool_kind_for_lane(next_plaid_api::state::EncodeLane::Query),
+        next_plaid_api::state::EncodePoolKind::Query
+    );
+    assert_eq!(
+        state.encode_pool_kind_for_lane(next_plaid_api::state::EncodeLane::Ingest),
+        next_plaid_api::state::EncodePoolKind::Ingest
+    );
+    assert!(
+        !state
+            .model_pool_for_kind(next_plaid_api::state::EncodePoolKind::Query)
+            .expect("query pool must exist")
+            .model_config
+            .use_cuda
+    );
+    assert!(
+        state
+            .model_pool_for_kind(next_plaid_api::state::EncodePoolKind::Ingest)
+            .expect("ingest pool must exist")
+            .model_config
+            .use_cuda
+    );
+}
+
+#[cfg(feature = "model")]
+#[test]
+fn single_model_pool_keeps_unified_encode_lane() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config = ApiConfig {
+        index_dir: temp_dir.path().to_path_buf(),
+        default_top_k: 10,
+    };
+
+    let state = AppState::with_model_pool(
+        config,
+        Some(dummy_model_pool("/models/unified", true, 2)),
+        None,
+    );
+
+    assert_eq!(
+        state.encode_pool_kind_for_lane(next_plaid_api::state::EncodeLane::Query),
+        next_plaid_api::state::EncodePoolKind::Unified
+    );
+    assert_eq!(
+        state.encode_pool_kind_for_lane(next_plaid_api::state::EncodeLane::Ingest),
+        next_plaid_api::state::EncodePoolKind::Unified
+    );
+    assert!(
+        state
+            .model_pool_for_kind(next_plaid_api::state::EncodePoolKind::Unified)
+            .expect("unified pool must exist")
+            .model_config
+            .use_cuda
+    );
+}
+
 /// Handle rate limit errors with a JSON response (same as main.rs).
 fn rate_limit_error(_err: tower_governor::GovernorError) -> axum::http::Response<axum::body::Body> {
     let body = serde_json::json!({

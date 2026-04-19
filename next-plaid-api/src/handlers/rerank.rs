@@ -48,6 +48,11 @@ fn score_desc_cmp(a: f32, b: f32) -> std::cmp::Ordering {
     }
 }
 
+#[cfg(feature = "model")]
+fn rerank_document_encode_lane() -> crate::state::EncodeLane {
+    crate::state::EncodeLane::Query
+}
+
 /// Compute ColBERT MaxSim score between a query and a document.
 ///
 /// For each query token, find the maximum cosine similarity with any document token,
@@ -202,7 +207,7 @@ pub async fn rerank_with_encoding(
     trace_id: Option<Extension<TraceId>>,
     Json(request): Json<crate::models::RerankWithEncodingRequest>,
 ) -> ApiResult<PrettyJson<RerankResponse>> {
-    use crate::handlers::encode::encode_texts_internal;
+    use crate::handlers::encode::{encode_texts_internal, encode_texts_internal_with_lane};
     use crate::models::InputType;
 
     let trace_id = trace_id.map(|t| t.0).unwrap_or_default();
@@ -240,10 +245,11 @@ pub async fn rerank_with_encoding(
         .ok_or_else(|| ApiError::Internal("Failed to encode query".to_string()))?;
 
     // Encode documents
-    let doc_embeddings = encode_texts_internal(
+    let doc_embeddings = encode_texts_internal_with_lane(
         state,
         &request.documents,
         InputType::Document,
+        rerank_document_encode_lane(),
         request.pool_factor,
     )
     .await?;
@@ -351,5 +357,14 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[cfg(feature = "model")]
+    #[test]
+    fn rerank_document_encoding_uses_query_lane() {
+        assert_eq!(
+            super::rerank_document_encode_lane(),
+            crate::state::EncodeLane::Query
+        );
     }
 }
