@@ -2306,6 +2306,108 @@ async fn test_project_sync_finalize_reaches_terminal_status_without_model() {
 }
 
 #[tokio::test]
+async fn test_project_sync_rejects_duplicate_paths_before_replace() {
+    let fixture = TestFixture::new().await;
+    let index_name = "project_sync_duplicate_path_test";
+
+    let documents: Vec<Value> = vec![
+        json!({"embeddings": [[1.0, 0.0, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 1.0, 0.0, 0.0]]}),
+    ];
+    let metadata: Vec<Value> = vec![
+        json!({"source_path": "src/lib.rs", "version": 1}),
+        json!({"source_path": "src/main.rs", "version": 1}),
+    ];
+    fixture
+        .create_and_populate_index(index_name, documents, metadata, None)
+        .await;
+
+    let payload = concat!(
+        "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 40 }\",\"language\":\"rust\"}\n",
+        "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 41 }\",\"language\":\"rust\"}\n"
+    )
+    .to_string();
+    let declared_bytes = payload.len() as u64;
+
+    let create_job_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+        .json(&json!({
+            "declared_bytes": declared_bytes,
+            "content_type": "application/x-ndjson"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+    let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+    let upload_resp = fixture
+        .client
+        .put(fixture.url(&format!(
+            "/project_sync/jobs/{}/upload",
+            create_job_body.job_id
+        )))
+        .header("content-type", "application/x-ndjson")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload_resp.status(), reqwest::StatusCode::OK);
+
+    let finalize_resp = fixture
+        .client
+        .post(fixture.url(&format!(
+            "/project_sync/jobs/{}/finalize",
+            create_job_body.job_id
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finalize_resp.status(), reqwest::StatusCode::OK);
+
+    let terminal_job = fixture
+        .wait_for_project_sync_terminal_status(&create_job_body.job_id, 10_000)
+        .await;
+    assert_eq!(terminal_job.status, ProjectSyncJobStatus::Failed);
+    assert!(terminal_job
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("duplicate path 'src/lib.rs'"));
+
+    fixture
+        .wait_for_exact_doc_count(index_name, 2, 10_000)
+        .await;
+    fixture.wait_for_metadata_count(index_name, 2, 10_000).await;
+
+    let lib_query_resp = fixture
+        .client
+        .post(fixture.url(&format!("/indices/{}/metadata/query", index_name)))
+        .json(&json!({
+            "condition": "source_path = ?",
+            "parameters": ["src/lib.rs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(lib_query_resp.status().is_success());
+    let lib_query_body: QueryMetadataResponse = lib_query_resp.json().await.unwrap();
+    assert_eq!(lib_query_body.count, 1);
+
+    let job_dir = fixture.project_sync_job_dir(&create_job_body.job_id);
+    assert!(!job_dir.join("spool.ndjson").exists());
+    assert!(!job_dir.join("spool.ndjson.tmp").exists());
+    assert!(!job_dir.join("index_snapshot").exists());
+    assert!(!fixture
+        ._temp_dir
+        .path()
+        .join("_project_sync_jobs")
+        .join("_dirty")
+        .exists());
+}
+
+#[tokio::test]
 async fn test_project_sync_admission_limits() {
     let fixture = TestFixture::new().await;
 
@@ -2656,6 +2758,154 @@ impl ModelTestFixture {
         format!("{}{}", self.base_url, path)
     }
 
+    async fn wait_for_exact_doc_count(&self, name: &str, expected_docs: usize, max_wait_ms: u64) {
+        let start = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        loop {
+            let resp = self
+                .client
+                .get(self.url(&format!("/indices/{}", name)))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(info) = resp.json::<IndexInfoResponse>().await {
+                        if info.num_documents == expected_docs {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed().as_millis() as u64 > max_wait_ms {
+                panic!(
+                    "Timeout waiting for index '{}' to have exactly {} documents",
+                    name, expected_docs
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_metadata_count(&self, name: &str, expected_docs: usize, max_wait_ms: u64) {
+        let start = std::time::Instant::now();
+        loop {
+            let resp = self
+                .client
+                .get(self.url(&format!("/indices/{}/metadata/count", name)))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.json::<Value>().await {
+                        if body["count"].as_u64() == Some(expected_docs as u64) {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed().as_millis() as u64 > max_wait_ms {
+                panic!(
+                    "Timeout waiting for index '{}' metadata count to reach {}",
+                    name, expected_docs
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_project_sync_terminal_status(
+        &self,
+        job_id: &str,
+        max_wait_ms: u64,
+    ) -> ProjectSyncJobResponse {
+        let start = std::time::Instant::now();
+        loop {
+            let resp = self
+                .client
+                .get(self.url(&format!("/project_sync/jobs/{}", job_id)))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(job) = resp.json::<ProjectSyncJobResponse>().await {
+                        if job.status == ProjectSyncJobStatus::Completed
+                            || job.status == ProjectSyncJobStatus::Failed
+                            || job.status == ProjectSyncJobStatus::Cancelled
+                            || job.status == ProjectSyncJobStatus::Expired
+                        {
+                            return job;
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed().as_millis() as u64 > max_wait_ms {
+                panic!(
+                    "Timeout waiting for project_sync job '{}' to reach terminal state",
+                    job_id
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn run_project_sync_job(
+        &self,
+        index_name: &str,
+        payload: &str,
+    ) -> ProjectSyncJobResponse {
+        let declared_bytes = payload.len() as u64;
+
+        let create_job_resp = self
+            .client
+            .post(self.url(&format!("/indices/{}/project_sync/jobs", index_name)))
+            .json(&json!({
+                "declared_bytes": declared_bytes,
+                "content_type": "application/x-ndjson"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_job_resp.status(), reqwest::StatusCode::OK);
+        let create_job_body: ProjectSyncCreateJobResponse = create_job_resp.json().await.unwrap();
+
+        let upload_resp = self
+            .client
+            .put(self.url(&format!(
+                "/project_sync/jobs/{}/upload",
+                create_job_body.job_id
+            )))
+            .header("content-type", "application/x-ndjson")
+            .body(payload.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload_resp.status(), reqwest::StatusCode::OK);
+        let upload_body: ProjectSyncJobResponse = upload_resp.json().await.unwrap();
+        assert_eq!(upload_body.status, ProjectSyncJobStatus::Uploaded);
+
+        let finalize_resp = self
+            .client
+            .post(self.url(&format!(
+                "/project_sync/jobs/{}/finalize",
+                create_job_body.job_id
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(finalize_resp.status(), reqwest::StatusCode::OK);
+        let finalize_body: ProjectSyncJobResponse = finalize_resp.json().await.unwrap();
+        assert_eq!(finalize_body.status, ProjectSyncJobStatus::Queued);
+
+        self.wait_for_project_sync_terminal_status(&create_job_body.job_id, 30_000)
+            .await
+    }
+
     /// Export the ONNX model by running the Python export script.
     fn export_model(workspace_root: &std::path::Path) -> Result<(), String> {
         let onnx_python_dir = workspace_root.join("onnx/python");
@@ -2775,12 +3025,32 @@ fn build_model_test_router_with_project_sync_timeout(
             post(handlers::rerank_with_encoding),
         );
 
+    let project_sync_index_routes = Router::new().route(
+        "/{name}/project_sync/jobs",
+        post(handlers::create_project_sync_job),
+    );
+
+    let project_sync_job_routes = Router::new()
+        .route(
+            "/project_sync/jobs/{job_id}/upload",
+            put(handlers::upload_project_sync_job),
+        )
+        .route(
+            "/project_sync/jobs/{job_id}/finalize",
+            post(handlers::finalize_project_sync_job),
+        )
+        .route(
+            "/project_sync/jobs/{job_id}",
+            get(handlers::get_project_sync_job).delete(handlers::cancel_project_sync_job),
+        );
+
     // Combine all routes under /indices
     let indices_router = Router::new()
         .merge(index_routes)
         .merge(document_routes)
         .merge(search_routes)
-        .merge(metadata_routes);
+        .merge(metadata_routes)
+        .merge(project_sync_index_routes);
 
     // Health check
     let health_handler = |state: axum::extract::State<Arc<AppState>>| async move {
@@ -2803,6 +3073,252 @@ fn build_model_test_router_with_project_sync_timeout(
                 .allow_headers(Any),
         )
         .with_state(state)
+}
+
+/// Test project_sync end-to-end with a loaded model.
+#[cfg(feature = "model")]
+#[tokio::test]
+async fn test_project_sync_completes_with_model() {
+    let Some(fixture) = ModelTestFixture::maybe_new().await else {
+        return;
+    };
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({
+            "name": "project_sync_model_complete_test",
+            "config": {"nbits": 4, "start_from_scratch": 50}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload = concat!(
+        "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 42 }\",\"language\":\"rust\",\"metadata\":{\"kind\":\"library\"}}\n",
+        "{\"path\":\"src/main.rs\",\"content\":\"fn main() { println!(\\\"hi\\\"); }\",\"language\":\"rust\",\"metadata\":{\"kind\":\"binary\"}}\n"
+    );
+
+    let terminal_job = fixture
+        .run_project_sync_job("project_sync_model_complete_test", payload)
+        .await;
+    assert_eq!(terminal_job.status, ProjectSyncJobStatus::Completed);
+    assert!(terminal_job.error.is_none(), "{:?}", terminal_job.error);
+
+    fixture
+        .wait_for_exact_doc_count("project_sync_model_complete_test", 2, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_model_complete_test", 2, 30_000)
+        .await;
+
+    let resp = fixture
+        .client
+        .get(fixture.url("/indices/project_sync_model_complete_test"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: IndexInfoResponse = resp.json().await.unwrap();
+    assert_eq!(body.num_documents, 2);
+    assert_eq!(body.metadata_count, Some(2));
+}
+
+/// Test project_sync replaces rows by source_path instead of duplicating them.
+#[cfg(feature = "model")]
+#[tokio::test]
+async fn test_project_sync_replaces_existing_source_path() {
+    let Some(fixture) = ModelTestFixture::maybe_new().await else {
+        return;
+    };
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({
+            "name": "project_sync_replace_test",
+            "config": {"nbits": 4, "start_from_scratch": 50}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload_v1 = concat!(
+        "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 41 }\",\"language\":\"rust\",\"metadata\":{\"version\":1}}\n",
+        "{\"path\":\"src/main.rs\",\"content\":\"fn main() { println!(\\\"old\\\"); }\",\"language\":\"rust\",\"metadata\":{\"version\":1}}\n"
+    );
+    let terminal_job_v1 = fixture
+        .run_project_sync_job("project_sync_replace_test", payload_v1)
+        .await;
+    assert_eq!(terminal_job_v1.status, ProjectSyncJobStatus::Completed);
+
+    fixture
+        .wait_for_exact_doc_count("project_sync_replace_test", 2, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_replace_test", 2, 30_000)
+        .await;
+
+    let payload_v2 = "{\"path\":\"src/lib.rs\",\"content\":\"pub fn answer() -> i32 { 42 }\",\"language\":\"rust\",\"metadata\":{\"version\":2}}\n";
+    let terminal_job_v2 = fixture
+        .run_project_sync_job("project_sync_replace_test", payload_v2)
+        .await;
+    assert_eq!(terminal_job_v2.status, ProjectSyncJobStatus::Completed);
+
+    fixture
+        .wait_for_exact_doc_count("project_sync_replace_test", 2, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_replace_test", 2, 30_000)
+        .await;
+
+    let lib_query_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_replace_test/metadata/query"))
+        .json(&json!({
+            "condition": "source_path = ?",
+            "parameters": ["src/lib.rs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(lib_query_resp.status().is_success());
+    let lib_query_body: QueryMetadataResponse = lib_query_resp.json().await.unwrap();
+    assert_eq!(lib_query_body.count, 1);
+    assert_eq!(lib_query_body.document_ids.len(), 1);
+
+    let lib_meta_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_replace_test/metadata/get"))
+        .json(&json!({
+            "document_ids": lib_query_body.document_ids
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(lib_meta_resp.status().is_success());
+    let lib_meta_body: GetMetadataResponse = lib_meta_resp.json().await.unwrap();
+    assert_eq!(lib_meta_body.count, 1);
+    assert_eq!(lib_meta_body.metadata[0]["source_path"], "src/lib.rs");
+    assert_eq!(lib_meta_body.metadata[0]["version"], 2);
+    assert_eq!(lib_meta_body.metadata[0]["source"], "project_sync");
+
+    let main_query_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_replace_test/metadata/query"))
+        .json(&json!({
+            "condition": "source_path = ?",
+            "parameters": ["src/main.rs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(main_query_resp.status().is_success());
+    let main_query_body: QueryMetadataResponse = main_query_resp.json().await.unwrap();
+    assert_eq!(main_query_body.count, 1);
+}
+
+/// Test project_sync and update_with_encoding produce the same document and metadata counts.
+#[cfg(feature = "model")]
+#[tokio::test]
+async fn test_project_sync_matches_update_with_encoding_counts() {
+    let Some(fixture) = ModelTestFixture::maybe_new().await else {
+        return;
+    };
+
+    let direct_create_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({
+            "name": "update_with_encoding_consistency_test",
+            "config": {"nbits": 4, "start_from_scratch": 50}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct_create_resp.status(), reqwest::StatusCode::OK);
+
+    let documents = vec![
+        "pub fn build_pool() -> Pool { Pool::new() }",
+        "fn main() { println!(\"server started\"); }",
+        "pub fn parse_config(raw: &str) -> Config { Config::from(raw) }",
+    ];
+    let metadata = vec![
+        json!({"source_path": "src/db.rs", "language": "rust", "source": "project_sync"}),
+        json!({"source_path": "src/main.rs", "language": "rust", "source": "project_sync"}),
+        json!({"source_path": "src/config.rs", "language": "rust", "source": "project_sync"}),
+    ];
+
+    let direct_update_resp = fixture
+        .client
+        .post(fixture.url("/indices/update_with_encoding_consistency_test/update_with_encoding"))
+        .json(&json!({
+            "documents": documents,
+            "metadata": metadata
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct_update_resp.status(), reqwest::StatusCode::ACCEPTED);
+    fixture
+        .wait_for_exact_doc_count("update_with_encoding_consistency_test", 3, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("update_with_encoding_consistency_test", 3, 30_000)
+        .await;
+
+    let sync_create_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({
+            "name": "project_sync_consistency_test",
+            "config": {"nbits": 4, "start_from_scratch": 50}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sync_create_resp.status(), reqwest::StatusCode::OK);
+
+    let sync_payload = concat!(
+        "{\"path\":\"src/db.rs\",\"content\":\"pub fn build_pool() -> Pool { Pool::new() }\",\"language\":\"rust\"}\n",
+        "{\"path\":\"src/main.rs\",\"content\":\"fn main() { println!(\\\"server started\\\"); }\",\"language\":\"rust\"}\n",
+        "{\"path\":\"src/config.rs\",\"content\":\"pub fn parse_config(raw: &str) -> Config { Config::from(raw) }\",\"language\":\"rust\"}\n"
+    );
+    let terminal_job = fixture
+        .run_project_sync_job("project_sync_consistency_test", sync_payload)
+        .await;
+    assert_eq!(terminal_job.status, ProjectSyncJobStatus::Completed);
+
+    fixture
+        .wait_for_exact_doc_count("project_sync_consistency_test", 3, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_consistency_test", 3, 30_000)
+        .await;
+
+    let direct_info_resp = fixture
+        .client
+        .get(fixture.url("/indices/update_with_encoding_consistency_test"))
+        .send()
+        .await
+        .unwrap();
+    assert!(direct_info_resp.status().is_success());
+    let direct_info: IndexInfoResponse = direct_info_resp.json().await.unwrap();
+
+    let sync_info_resp = fixture
+        .client
+        .get(fixture.url("/indices/project_sync_consistency_test"))
+        .send()
+        .await
+        .unwrap();
+    assert!(sync_info_resp.status().is_success());
+    let sync_info: IndexInfoResponse = sync_info_resp.json().await.unwrap();
+
+    assert_eq!(sync_info.num_documents, direct_info.num_documents);
+    assert_eq!(sync_info.metadata_count, direct_info.metadata_count);
+    assert_eq!(sync_info.num_embeddings, direct_info.num_embeddings);
 }
 
 /// Test update_with_encoding: create an index and add documents using text encoding.
