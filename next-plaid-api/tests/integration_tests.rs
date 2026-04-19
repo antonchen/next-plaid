@@ -940,6 +940,132 @@ async fn test_filtered_search() {
 }
 
 #[tokio::test]
+async fn test_search_respects_subset_intersection_with_filter_for_semantic_queries() {
+    let fixture = TestFixture::new().await;
+
+    let documents: Vec<Value> = vec![
+        json!({"embeddings": [[1.0, 0.0, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.9, 0.1, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.7, 0.3, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.6, 0.4, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 1.0, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 0.0, 1.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.9, 0.1]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.8, 0.2]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.7, 0.3]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.6, 0.4]]}),
+    ];
+    let metadata: Vec<Value> = vec![
+        json!({"doc_id": 0, "category": "A", "title": "alpha zero"}),
+        json!({"doc_id": 1, "category": "A", "title": "alpha one"}),
+        json!({"doc_id": 2, "category": "A", "title": "alpha two"}),
+        json!({"doc_id": 3, "category": "A", "title": "alpha three"}),
+        json!({"doc_id": 4, "category": "A", "title": "alpha four"}),
+        json!({"doc_id": 5, "category": "B", "title": "beta five"}),
+        json!({"doc_id": 6, "category": "B", "title": "beta six"}),
+        json!({"doc_id": 7, "category": "B", "title": "beta seven"}),
+        json!({"doc_id": 8, "category": "B", "title": "beta eight"}),
+        json!({"doc_id": 9, "category": "B", "title": "beta nine"}),
+    ];
+
+    fixture
+        .create_and_populate_index(
+            "search_subset_filter_semantic_test",
+            documents,
+            metadata,
+            None,
+        )
+        .await;
+
+    let resp = fixture
+        .client
+        .post(fixture.url("/indices/search_subset_filter_semantic_test/search"))
+        .json(&json!({
+            "queries": [{"embeddings": [[1.0, 0.0, 0.0, 0.0]]}],
+            "params": {"top_k": 10},
+            "subset": [2, 3, 7, 8],
+            "filter_condition": "category = ?",
+            "filter_parameters": ["A"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body: SearchResponse = resp.json().await.unwrap();
+    let result = &body.results[0];
+
+    assert_eq!(result.document_ids, vec![2, 3]);
+    assert!(!result.document_ids.contains(&0));
+    assert!(!result.document_ids.contains(&1));
+    assert!(!result.document_ids.contains(&7));
+    assert!(!result.document_ids.contains(&8));
+}
+
+#[tokio::test]
+async fn test_search_respects_subset_intersection_with_filter_for_keyword_queries() {
+    let fixture = TestFixture::new().await;
+
+    let documents: Vec<Value> = vec![
+        json!({"embeddings": [[1.0, 0.0, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.9, 0.1, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.7, 0.3, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.6, 0.4, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 1.0, 0.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 0.0, 1.0, 0.0]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.9, 0.1]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.8, 0.2]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.7, 0.3]]}),
+        json!({"embeddings": [[0.0, 0.0, 0.6, 0.4]]}),
+    ];
+    let metadata: Vec<Value> = vec![
+        json!({"doc_id": 0, "category": "A", "title": "alpha zero"}),
+        json!({"doc_id": 1, "category": "A", "title": "alpha one"}),
+        json!({"doc_id": 2, "category": "A", "title": "alpha two"}),
+        json!({"doc_id": 3, "category": "A", "title": "alpha three"}),
+        json!({"doc_id": 4, "category": "A", "title": "alpha four"}),
+        json!({"doc_id": 5, "category": "B", "title": "gamma five"}),
+        json!({"doc_id": 6, "category": "B", "title": "gamma six"}),
+        json!({"doc_id": 7, "category": "B", "title": "alpha seven"}),
+        json!({"doc_id": 8, "category": "B", "title": "alpha eight"}),
+        json!({"doc_id": 9, "category": "B", "title": "gamma nine"}),
+    ];
+
+    fixture
+        .create_and_populate_index(
+            "search_subset_filter_keyword_test",
+            documents,
+            metadata,
+            None,
+        )
+        .await;
+
+    let resp = fixture
+        .client
+        .post(fixture.url("/indices/search_subset_filter_keyword_test/search"))
+        .json(&json!({
+            "text_query": ["alpha"],
+            "params": {"top_k": 10},
+            "subset": [2, 3, 7, 8],
+            "filter_condition": "category = ?",
+            "filter_parameters": ["A"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body: SearchResponse = resp.json().await.unwrap();
+    let result = &body.results[0];
+
+    assert_eq!(result.document_ids, vec![2, 3]);
+    assert!(!result.document_ids.contains(&0));
+    assert!(!result.document_ids.contains(&1));
+    assert!(!result.document_ids.contains(&7));
+    assert!(!result.document_ids.contains(&8));
+}
+
+#[tokio::test]
 async fn test_metadata_check() {
     let fixture = TestFixture::new().await;
     let dim = 32;
