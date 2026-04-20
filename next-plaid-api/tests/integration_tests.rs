@@ -1931,10 +1931,8 @@ async fn test_project_sync_create_upload_cancel_status() {
         )))
         .header("content-type", "application/x-ndjson")
         .body(
-            concat!(
-                "{\"path\":\"src/other.rs\",\"content\":\"fn other() {}\",\"language\":\"rust\"}\n"
-            )
-            .to_string(),
+            "{\"path\":\"src/other.rs\",\"content\":\"fn other() {}\",\"language\":\"rust\"}\n"
+                .to_string(),
         )
         .send()
         .await

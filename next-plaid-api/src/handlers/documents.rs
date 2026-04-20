@@ -246,6 +246,24 @@ fn build_update_config(stored_config: &IndexConfigStored) -> UpdateConfig {
     }
 }
 
+fn build_stored_index_config(req: &CreateIndexRequest) -> IndexConfigStored {
+    IndexConfigStored {
+        nbits: req.config.nbits.unwrap_or(4),
+        batch_size: req.config.batch_size.unwrap_or(50_000),
+        seed: req.config.seed,
+        start_from_scratch: req
+            .config
+            .start_from_scratch
+            .unwrap_or(next_plaid::default_start_from_scratch()),
+        max_documents: req.config.max_documents,
+        fts_tokenizer: req
+            .config
+            .fts_tokenizer
+            .clone()
+            .unwrap_or_else(|| "unicode61".to_string()),
+    }
+}
+
 // --- Batch Collection ---
 
 /// Get the maximum number of documents to batch together before processing.
@@ -1108,18 +1126,7 @@ pub async fn create_index(
     }
 
     // Build stored config
-    let stored_config = IndexConfigStored {
-        nbits: req.config.nbits.unwrap_or(4),
-        batch_size: req.config.batch_size.unwrap_or(50_000),
-        seed: req.config.seed,
-        start_from_scratch: req.config.start_from_scratch.unwrap_or(999),
-        max_documents: req.config.max_documents,
-        fts_tokenizer: req
-            .config
-            .fts_tokenizer
-            .clone()
-            .unwrap_or_else(|| "unicode61".to_string()),
-    };
+    let stored_config = build_stored_index_config(&req);
 
     // Create index directory
     std::fs::create_dir_all(&index_path)
@@ -1839,7 +1846,11 @@ pub async fn update_index_with_encoding(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_index_lock_by_path, get_index_semaphore, get_index_write_lock};
+    use super::{
+        build_stored_index_config, build_update_config, get_index_lock_by_path,
+        get_index_semaphore, get_index_write_lock,
+    };
+    use crate::models::{CreateIndexRequest, IndexConfigRequest, IndexConfigStored};
     use crate::state::{ApiConfig, AppState};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1911,5 +1922,64 @@ mod tests {
         let semaphore_b = get_index_semaphore(&state_b, "shared");
 
         assert!(!Arc::ptr_eq(&semaphore_a, &semaphore_b));
+    }
+
+    #[test]
+    fn build_update_config_uses_stored_start_from_scratch() {
+        let stored_config = IndexConfigStored {
+            nbits: 4,
+            batch_size: 12_345,
+            seed: Some(7),
+            start_from_scratch: 17,
+            max_documents: None,
+            fts_tokenizer: "unicode61".to_string(),
+        };
+
+        let update_config = build_update_config(&stored_config);
+
+        assert_eq!(update_config.batch_size, 12_345);
+        assert_eq!(update_config.seed, 7);
+        assert_eq!(update_config.start_from_scratch, 17);
+    }
+
+    #[test]
+    fn build_stored_index_config_uses_request_start_from_scratch_when_present() {
+        let req = CreateIndexRequest {
+            name: "idx".to_string(),
+            config: IndexConfigRequest {
+                nbits: Some(4),
+                batch_size: Some(50_000),
+                seed: Some(42),
+                start_from_scratch: Some(23),
+                max_documents: None,
+                fts_tokenizer: Some("unicode61".to_string()),
+            },
+        };
+
+        let stored_config = build_stored_index_config(&req);
+
+        assert_eq!(stored_config.start_from_scratch, 23);
+    }
+
+    #[test]
+    fn build_stored_index_config_uses_runtime_default_when_request_omits_threshold() {
+        let req = CreateIndexRequest {
+            name: "idx".to_string(),
+            config: IndexConfigRequest {
+                nbits: Some(4),
+                batch_size: Some(50_000),
+                seed: Some(42),
+                start_from_scratch: None,
+                max_documents: None,
+                fts_tokenizer: Some("unicode61".to_string()),
+            },
+        };
+
+        let stored_config = build_stored_index_config(&req);
+
+        assert_eq!(
+            stored_config.start_from_scratch,
+            next_plaid::default_start_from_scratch()
+        );
     }
 }
