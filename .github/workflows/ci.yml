@@ -13,6 +13,7 @@ env:
 jobs:
   fmt:
     name: Format
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +24,7 @@ jobs:
 
   clippy:
     name: Clippy
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +39,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,6 +64,7 @@ jobs:
 
   doc:
     name: Documentation
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +78,7 @@ jobs:
 
   bench-check:
     name: Bench Check
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +90,7 @@ jobs:
 
   onnx-test:
     name: ONNX Crate Tests
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +102,7 @@ jobs:
 
   onnx-clippy:
     name: ONNX Crate Clippy
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,55 +113,3 @@ jobs:
       - name: Clippy (ONNX crate)
         working-directory: next-plaid-onnx
         run: cargo clippy --all-targets -- -D warnings
-
-  colgrep-fmt:
-    name: Colgrep Crate Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Format check (colgrep crate)
-        working-directory: colgrep
-        run: cargo fmt --all -- --check
-
-  colgrep-test:
-    name: Colgrep Crate Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run colgrep crate tests
-        working-directory: colgrep
-        run: cargo test
-
-  colgrep-clippy:
-    name: Colgrep Crate Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy (colgrep crate)
-        working-directory: colgrep
-        run: cargo clippy --all-targets -- -D warnings
-
-  python-sdk-test:
-    name: Python SDK Tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: next-plaid-api/python-sdk
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-      - name: Run unit tests
-        run: pytest tests/test_cli.py -v --tb=short

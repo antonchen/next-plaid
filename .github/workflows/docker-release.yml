@@ -16,10 +16,10 @@
 # Version is automatically extracted from Cargo.toml
 #
 # Images will be published as:
-#   - ghcr.io/<owner>/nxt-plaid:cpu-<version>
-#   - ghcr.io/<owner>/nxt-plaid:cpu-latest
-#   - ghcr.io/<owner>/nxt-plaid:cuda-<version>
-#   - ghcr.io/<owner>/nxt-plaid:cuda-latest
+#   - ghcr.io/antonchen/next-plaid:cpu-<version>
+#   - ghcr.io/antonchen/next-plaid:cpu-latest
+#   - ghcr.io/antonchen/next-plaid:cuda-<version>
+#   - ghcr.io/antonchen/next-plaid:cuda-latest
 # =============================================================================
 
 name: Docker Release
@@ -29,10 +29,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: lightonai/next-plaid
+  IMAGE_NAME: antonchen/next-plaid
 
 jobs:
   get-version:
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -46,6 +47,7 @@ jobs:
 
   build-and-push:
     name: Build and Push (${{ matrix.variant }})
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     needs: get-version
     runs-on: ubuntu-latest
     strategy:
@@ -105,6 +107,7 @@ jobs:
 
   create-release-summary:
     name: Create Release Summary
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
     needs: [get-version, build-and-push]
     runs-on: ubuntu-latest
     permissions:
@@ -166,4 +169,4 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
         env:
           REGISTRY: ghcr.io
-          IMAGE_NAME: lightonai/next-plaid
+          IMAGE_NAME: antonchen/next-plaid

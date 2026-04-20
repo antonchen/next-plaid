@@ -20,6 +20,9 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ github.repository == 'antonchen/next-plaid' }}
+    env:
+      PAGES_URL: ${{ vars.PAGES_URL }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,17 +38,20 @@ jobs:
           python docs/build_docs.py \
             --root . \
             --output docs/_site \
-            --include . next-plaid next-plaid-api next-plaid-api/python-sdk next-plaid-onnx next-plaid-onnx/python colgrep
+            --include . next-plaid next-plaid-api next-plaid-onnx next-plaid-onnx/python
 
       - name: Setup Pages
+        if: ${{ env.PAGES_URL != '' }}
         uses: actions/configure-pages@v4
 
       - name: Upload artifact
+        if: ${{ env.PAGES_URL != '' }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs/_site
 
   deploy:
+    if: ${{ github.repository == 'antonchen/next-plaid' && vars.PAGES_URL != '' }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
