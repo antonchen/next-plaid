@@ -507,6 +507,14 @@ const TEST_PROJECT_SYNC_MAX_INGEST_REQUEST_BYTES: usize = 100 * 1024 * 1024;
 fn build_project_sync_control_test_router(project_sync_timeout: Duration) -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/indices/{name}/project_sync/files",
+            get(handlers::get_project_sync_files),
+        )
+        .route(
+            "/indices/{name}/project_sync/files/check",
+            post(handlers::check_project_sync_files),
+        )
+        .route(
             "/indices/{name}/project_sync/jobs",
             post(handlers::create_project_sync_job),
         )
@@ -3023,10 +3031,19 @@ fn build_model_test_router_with_project_sync_timeout(
             post(handlers::rerank_with_encoding),
         );
 
-    let project_sync_index_routes = Router::new().route(
-        "/{name}/project_sync/jobs",
-        post(handlers::create_project_sync_job),
-    );
+    let project_sync_index_routes = Router::new()
+        .route(
+            "/{name}/project_sync/files",
+            get(handlers::get_project_sync_files),
+        )
+        .route(
+            "/{name}/project_sync/files/check",
+            post(handlers::check_project_sync_files),
+        )
+        .route(
+            "/{name}/project_sync/jobs",
+            post(handlers::create_project_sync_job),
+        );
 
     let project_sync_job_routes = Router::new()
         .route(
@@ -3123,10 +3140,10 @@ async fn test_project_sync_completes_with_model() {
     assert_eq!(body.metadata_count, Some(2));
 }
 
-/// Test project_sync replaces rows by source_path instead of duplicating them.
+/// Test project_sync replaces rows by relative_path instead of duplicating them.
 #[cfg(feature = "model")]
 #[tokio::test]
-async fn test_project_sync_replaces_existing_source_path() {
+async fn test_project_sync_replaces_existing_relative_path() {
     let Some(fixture) = ModelTestFixture::maybe_new().await else {
         return;
     };
@@ -3216,6 +3233,108 @@ async fn test_project_sync_replaces_existing_source_path() {
     assert!(main_query_resp.status().is_success());
     let main_query_body: QueryMetadataResponse = main_query_resp.json().await.unwrap();
     assert_eq!(main_query_body.count, 1);
+}
+
+/// Test project_sync file manifest APIs and unchanged content_hash skip.
+#[cfg(feature = "model")]
+#[tokio::test]
+async fn test_project_sync_manifest_check_and_unchanged_skip() {
+    let Some(fixture) = ModelTestFixture::maybe_new().await else {
+        return;
+    };
+
+    let create_index_resp = fixture
+        .client
+        .post(fixture.url("/indices"))
+        .json(&json!({
+            "name": "project_sync_manifest_skip_test",
+            "config": {"nbits": 4, "start_from_scratch": 50}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_index_resp.status(), reqwest::StatusCode::OK);
+
+    let payload_v1 = concat!(
+        "{\"path\":\"src/lib.rs\",\"relative_path\":\"src/lib.rs\",\"content_hash\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"chunk_index\":1,\"chunk_count\":1,\"content\":\"pub fn answer() -> i32 { 42 }\",\"language\":\"rust\",\"metadata\":{\"kind\":\"source\",\"start_line\":1,\"end_line\":1}}\n",
+        "{\"path\":\"src/main.rs\",\"relative_path\":\"src/main.rs\",\"content_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"chunk_index\":1,\"chunk_count\":1,\"content\":\"fn main() { println!(\\\"hi\\\"); }\",\"language\":\"rust\",\"metadata\":{\"kind\":\"source\",\"start_line\":1,\"end_line\":1}}\n"
+    );
+    let terminal_job_v1 = fixture
+        .run_project_sync_job("project_sync_manifest_skip_test", payload_v1)
+        .await;
+    assert_eq!(terminal_job_v1.status, ProjectSyncJobStatus::Completed);
+
+    fixture
+        .wait_for_exact_doc_count("project_sync_manifest_skip_test", 2, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_manifest_skip_test", 2, 30_000)
+        .await;
+
+    let files_resp = fixture
+        .client
+        .get(fixture.url("/indices/project_sync_manifest_skip_test/project_sync/files"))
+        .send()
+        .await
+        .unwrap();
+    assert!(files_resp.status().is_success());
+    let files_body: Value = files_resp.json().await.unwrap();
+    assert_eq!(files_body["chunker_version"], 1);
+    assert_eq!(files_body["max_lines_per_blob"], 200);
+    assert_eq!(files_body["files"].as_array().unwrap().len(), 2);
+
+    let check_resp = fixture
+        .client
+        .post(fixture.url(
+            "/indices/project_sync_manifest_skip_test/project_sync/files/check",
+        ))
+        .json(&json!({
+            "chunker_version": 1,
+            "max_lines_per_blob": 200,
+            "files": [
+                {
+                    "relative_path": "src/lib.rs",
+                    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "relative_path": "src/new.rs",
+                    "content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(check_resp.status().is_success());
+    let check_body: Value = check_resp.json().await.unwrap();
+    assert_eq!(check_body["manifest_mismatch"], false);
+    assert_eq!(check_body["unchanged"], json!(["src/lib.rs"]));
+    assert_eq!(check_body["missing"], json!(["src/new.rs"]));
+
+    let terminal_job_v2 = fixture
+        .run_project_sync_job("project_sync_manifest_skip_test", payload_v1)
+        .await;
+    assert_eq!(terminal_job_v2.status, ProjectSyncJobStatus::Completed);
+    fixture
+        .wait_for_exact_doc_count("project_sync_manifest_skip_test", 2, 30_000)
+        .await;
+    fixture
+        .wait_for_metadata_count("project_sync_manifest_skip_test", 2, 30_000)
+        .await;
+
+    let lib_query_resp = fixture
+        .client
+        .post(fixture.url("/indices/project_sync_manifest_skip_test/metadata/query"))
+        .json(&json!({
+            "condition": "relative_path = ?",
+            "parameters": ["src/lib.rs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(lib_query_resp.status().is_success());
+    let lib_query_body: QueryMetadataResponse = lib_query_resp.json().await.unwrap();
+    assert_eq!(lib_query_body.count, 1);
 }
 
 /// Test project_sync and update_with_encoding produce the same document and metadata counts.

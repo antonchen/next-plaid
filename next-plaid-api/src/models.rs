@@ -856,6 +856,84 @@ pub struct ProjectSyncJobResponse {
     pub error: Option<String>,
 }
 
+/// One file row in the project_sync file manifest.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProjectSyncFileEntryResponse {
+    /// Project-relative source path.
+    #[schema(example = "src/lib.rs")]
+    pub relative_path: String,
+    /// SHA-256 hash of the canonical indexed file content.
+    #[schema(example = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
+    pub content_hash: String,
+    /// Source language.
+    #[schema(example = "rust")]
+    pub language: String,
+    /// Number of indexed chunks for this file.
+    #[schema(example = 3)]
+    pub chunk_count: usize,
+    /// Server-side update timestamp in epoch milliseconds.
+    #[schema(example = 1713760000000u64)]
+    pub updated_at_ms: u64,
+}
+
+/// Response listing project_sync file manifest entries.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProjectSyncFilesResponse {
+    /// Index name.
+    #[schema(example = "project_1234abcd")]
+    pub index_name: String,
+    /// Manifest schema version.
+    #[schema(example = 1)]
+    pub version: u32,
+    /// Client chunker version recorded in the manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1)]
+    pub chunker_version: Option<u32>,
+    /// Max lines per file chunk recorded in the manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 200)]
+    pub max_lines_per_blob: Option<usize>,
+    /// File manifest rows.
+    pub files: Vec<ProjectSyncFileEntryResponse>,
+}
+
+/// One client file hash for project_sync manifest checking.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ProjectSyncFileCheckItem {
+    /// Project-relative source path.
+    #[schema(example = "src/lib.rs")]
+    pub relative_path: String,
+    /// SHA-256 hash of the canonical indexed file content.
+    #[schema(example = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
+    pub content_hash: String,
+}
+
+/// Request to compare local file hashes against the project_sync manifest.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ProjectSyncFilesCheckRequest {
+    /// Client chunker version.
+    #[schema(example = 1)]
+    pub chunker_version: u32,
+    /// Client max lines per file chunk.
+    #[schema(example = 200)]
+    pub max_lines_per_blob: usize,
+    /// File hashes to compare.
+    pub files: Vec<ProjectSyncFileCheckItem>,
+}
+
+/// Response from project_sync file hash comparison.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProjectSyncFilesCheckResponse {
+    /// Files already present remotely with the same content hash.
+    pub unchanged: Vec<String>,
+    /// Files present remotely with a different content hash.
+    pub changed: Vec<String>,
+    /// Files not present in the remote manifest.
+    pub missing: Vec<String>,
+    /// Whether manifest chunk configuration does not match the request.
+    pub manifest_mismatch: bool,
+}
+
 // =============================================================================
 // Reranking
 // =============================================================================

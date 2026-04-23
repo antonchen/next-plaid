@@ -98,6 +98,8 @@ use state::{ApiConfig, AppState};
         handlers::documents::update_index_config,
         handlers::documents::update_index_with_encoding,
         handlers::project_sync::create_project_sync_job,
+        handlers::project_sync::get_project_sync_files,
+        handlers::project_sync::check_project_sync_files,
         handlers::project_sync::upload_project_sync_job,
         handlers::project_sync::finalize_project_sync_job,
         handlers::project_sync::get_project_sync_job,
@@ -161,6 +163,11 @@ use state::{ApiConfig, AppState};
         models::ProjectSyncCreateJobResponse,
         models::ProjectSyncJobStatus,
         models::ProjectSyncJobResponse,
+        models::ProjectSyncFileEntryResponse,
+        models::ProjectSyncFilesResponse,
+        models::ProjectSyncFileCheckItem,
+        models::ProjectSyncFilesCheckRequest,
+        models::ProjectSyncFilesCheckResponse,
         models::RerankRequest,
         models::RerankWithEncodingRequest,
         models::RerankResult,
@@ -433,6 +440,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/indices/{name}/project_sync/jobs",
             post(handlers::create_project_sync_job),
+        )
+        .route(
+            "/indices/{name}/project_sync/files",
+            get(handlers::get_project_sync_files),
+        )
+        .route(
+            "/indices/{name}/project_sync/files/check",
+            post(handlers::check_project_sync_files),
         )
         .route(
             "/project_sync/jobs/{job_id}/finalize",

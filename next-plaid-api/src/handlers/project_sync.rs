@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs as std_fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,9 @@ use crate::handlers::documents::{
 };
 use crate::models::{
     ErrorResponse, ProjectSyncCreateJobRequest, ProjectSyncCreateJobResponse,
-    ProjectSyncJobResponse, ProjectSyncJobStatus, UpdateWithEncodingRequest,
+    ProjectSyncFileCheckItem, ProjectSyncFileEntryResponse, ProjectSyncFilesCheckRequest,
+    ProjectSyncFilesCheckResponse, ProjectSyncFilesResponse, ProjectSyncJobResponse,
+    ProjectSyncJobStatus, UpdateWithEncodingRequest,
 };
 use crate::state::AppState;
 use crate::PrettyJson;
@@ -46,6 +48,8 @@ const PROJECT_SYNC_UPLOAD_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const PROJECT_SYNC_STALE_JOB_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const PROJECT_SYNC_UPLOAD_PROGRESS_UPDATE_INTERVAL_MS: u64 = 5 * 1000;
 const PROJECT_SYNC_UPLOAD_PROGRESS_UPDATE_BYTES: u64 = 1024 * 1024;
+const PROJECT_SYNC_CHUNKER_VERSION: u32 = 1;
+const PROJECT_SYNC_MAX_LINES_PER_BLOB: usize = 200;
 
 static CREATE_JOB_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 static JOB_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -65,14 +69,69 @@ struct ProjectSyncJobManifest {
     updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum ProjectSyncRecordOp {
+    #[default]
+    Upsert,
+    Delete,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProjectSyncUploadRecord {
-    path: String,
-    content: String,
+    #[serde(default)]
+    op: ProjectSyncRecordOp,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    relative_path: Option<String>,
+    #[serde(default)]
+    content_hash: Option<String>,
+    #[serde(default)]
+    chunk_index: Option<usize>,
+    #[serde(default)]
+    chunk_count: Option<usize>,
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectSyncUpsertRecord {
+    source_path: String,
+    relative_path: String,
+    content: String,
+    language: Option<String>,
+    metadata: Option<serde_json::Value>,
+    content_hash: Option<String>,
+    chunk_index: Option<usize>,
+    chunk_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectSyncUpsertFile {
+    relative_path: String,
+    content_hash: Option<String>,
+    language: String,
+    chunk_count: usize,
+    records: Vec<ProjectSyncUpsertRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectSyncPlan {
+    upsert_files: Vec<ProjectSyncUpsertFile>,
+    delete_relative_paths: Vec<String>,
+    record_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectSyncExecutablePlan {
+    changed_upsert_files: Vec<ProjectSyncUpsertFile>,
+    skipped_unchanged_files: Vec<ProjectSyncUpsertFile>,
+    delete_relative_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1037,6 +1096,114 @@ async fn sweep_expired_project_sync_jobs(state: &AppState, now_ms: u64) -> ApiRe
 }
 
 #[utoipa::path(
+    get,
+    path = "/indices/{name}/project_sync/files",
+    tag = "project_sync",
+    params(
+        ("name" = String, Path, description = "Index name")
+    ),
+    responses(
+        (status = 200, description = "Project sync file manifest", body = ProjectSyncFilesResponse),
+        (status = 404, description = "Index not declared", body = ErrorResponse)
+    )
+)]
+pub async fn get_project_sync_files(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> ApiResult<Json<ProjectSyncFilesResponse>> {
+    let index_path = state.index_path(&name);
+    if !index_path.join("config.json").exists() {
+        return Err(ApiError::IndexNotDeclared(name));
+    }
+    let index_path_string = index_path.to_string_lossy().to_string();
+    let entries = filtering::list_project_files(&index_path_string).map_err(ApiError::NextPlaid)?;
+    let config =
+        filtering::get_project_manifest_config(&index_path_string).map_err(ApiError::NextPlaid)?;
+    let files = entries
+        .into_iter()
+        .map(project_file_entry_to_response)
+        .collect::<Vec<ProjectSyncFileEntryResponse>>();
+    Ok(Json(ProjectSyncFilesResponse {
+        index_name: name,
+        version: filtering::PROJECT_MANIFEST_VERSION,
+        chunker_version: config.as_ref().map(|config| config.chunker_version),
+        max_lines_per_blob: config.as_ref().map(|config| config.max_lines_per_blob),
+        files,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/indices/{name}/project_sync/files/check",
+    tag = "project_sync",
+    params(
+        ("name" = String, Path, description = "Index name")
+    ),
+    request_body = ProjectSyncFilesCheckRequest,
+    responses(
+        (status = 200, description = "Project sync file hash comparison", body = ProjectSyncFilesCheckResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Index not declared", body = ErrorResponse)
+    )
+)]
+pub async fn check_project_sync_files(
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    request: Result<Json<ProjectSyncFilesCheckRequest>, JsonRejection>,
+) -> ApiResult<Json<ProjectSyncFilesCheckResponse>> {
+    let Json(request) = request.map_err(|error| ApiError::BadRequest(error.body_text()))?;
+    let index_path = state.index_path(&name);
+    if !index_path.join("config.json").exists() {
+        return Err(ApiError::IndexNotDeclared(name));
+    }
+    validate_project_sync_file_check_items(&request.files)?;
+
+    let index_path_string = index_path.to_string_lossy().to_string();
+    let config =
+        filtering::get_project_manifest_config(&index_path_string).map_err(ApiError::NextPlaid)?;
+    let manifest_mismatch = !matches!(
+        config,
+        Some(filtering::ProjectManifestConfig {
+            version: filtering::PROJECT_MANIFEST_VERSION,
+            chunker_version,
+            max_lines_per_blob
+        }) if chunker_version == request.chunker_version
+            && max_lines_per_blob == request.max_lines_per_blob
+    );
+    let relative_paths = request
+        .files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<String>>();
+    let remote_files = filtering::get_project_files(&index_path_string, &relative_paths)
+        .map_err(ApiError::NextPlaid)?;
+    let remote_by_path = remote_files
+        .into_iter()
+        .map(|entry| (entry.relative_path.clone(), entry))
+        .collect::<HashMap<String, filtering::ProjectFileEntry>>();
+
+    let mut unchanged = Vec::new();
+    let mut changed = Vec::new();
+    let mut missing = Vec::new();
+    for item in &request.files {
+        match remote_by_path.get(&item.relative_path) {
+            Some(entry) if !manifest_mismatch && entry.content_hash == item.content_hash => {
+                unchanged.push(item.relative_path.clone());
+            }
+            Some(_) => changed.push(item.relative_path.clone()),
+            None => missing.push(item.relative_path.clone()),
+        }
+    }
+
+    Ok(Json(ProjectSyncFilesCheckResponse {
+        unchanged,
+        changed,
+        missing,
+        manifest_mismatch,
+    }))
+}
+
+#[utoipa::path(
     post,
     path = "/indices/{name}/project_sync/jobs",
     tag = "project_sync",
@@ -1578,7 +1745,7 @@ async fn run_project_sync_job_inner(state: Arc<AppState>, job_id: &str) -> ApiRe
 
     let manifest = read_manifest(&state, job_id).await?;
     let spool = spool_path(&state, job_id);
-    let source_paths = collect_project_sync_source_paths(&spool).await?;
+    let plan = collect_project_sync_plan(&spool).await?;
     let path_str = state
         .index_path(&manifest.index_name)
         .to_string_lossy()
@@ -1594,24 +1761,60 @@ async fn run_project_sync_job_inner(state: Arc<AppState>, job_id: &str) -> ApiRe
                 ApiError::Internal(format!("Index/DB sync preflight repair failed: {}", error))
             })?;
         ensure_project_sync_job_not_cancelled(&state, job_id).await?;
+        let executable_plan = build_project_sync_executable_plan(&path_str, plan.clone())?;
+        if executable_plan.changed_upsert_files.is_empty()
+            && executable_plan.delete_relative_paths.is_empty()
+        {
+            tracing::info!(
+                job_id = %job_id,
+                index = %manifest.index_name,
+                skipped_unchanged_files = executable_plan.skipped_unchanged_files.len(),
+                records = plan.record_count,
+                "project_sync.noop.skip_all_unchanged"
+            );
+            return Ok(());
+        }
         snapshot =
             Some(create_project_sync_snapshot(state.clone(), &manifest.index_name, job_id).await?);
         ensure_project_sync_job_not_cancelled(&state, job_id).await?;
-        let deleted_existing = delete_existing_source_paths_after_repair_locked(
+        let changed_relative_paths = executable_plan
+            .changed_upsert_files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<String>>();
+        let mut relative_paths_to_delete = changed_relative_paths;
+        relative_paths_to_delete.extend(executable_plan.delete_relative_paths.iter().cloned());
+        relative_paths_to_delete.sort();
+        relative_paths_to_delete.dedup();
+        let deleted_existing = delete_existing_relative_paths_after_repair_locked(
             state.clone(),
             &manifest.index_name,
-            &source_paths,
+            &relative_paths_to_delete,
         )
         .await?;
+        let deleted_manifest_rows =
+            filtering::delete_project_files(&path_str, &executable_plan.delete_relative_paths)
+                .map_err(ApiError::NextPlaid)?;
         tracing::info!(
             job_id = %job_id,
             index = %manifest.index_name,
             deleted_existing = deleted_existing,
-            source_paths = source_paths.len(),
+            deleted_manifest_rows = deleted_manifest_rows,
+            changed_files = executable_plan.changed_upsert_files.len(),
+            deleted_files = executable_plan.delete_relative_paths.len(),
+            skipped_unchanged_files = executable_plan.skipped_unchanged_files.len(),
+            records = plan.record_count,
             "project_sync.replace.deleted_existing"
         );
         ensure_project_sync_job_not_cancelled(&state, job_id).await?;
-        process_spool_batches_locked(state.clone(), job_id, &manifest.index_name, &spool).await?;
+        process_project_sync_files_locked(
+            state.clone(),
+            job_id,
+            &manifest.index_name,
+            &path_str,
+            executable_plan,
+        )
+        .await?;
         ensure_project_sync_job_not_cancelled(&state, job_id).await?;
         run_project_sync_postflight_locked(&path_str).await?;
         Ok(())
@@ -1710,15 +1913,14 @@ async fn run_project_sync_job_inner(state: Arc<AppState>, job_id: &str) -> ApiRe
         return Ok(());
     }
 
-    let snapshot_path = snapshot.ok_or_else(|| {
-        ApiError::Internal("project_sync snapshot missing after successful processing".to_string())
-    })?;
-    if let Err(cleanup_error) = remove_project_sync_snapshot(&snapshot_path).await {
-        tracing::warn!(
-            job_id = %job_id,
-            error = %cleanup_error,
-            "project_sync.snapshot.cleanup_failed"
-        );
+    if let Some(snapshot_path) = snapshot.as_ref() {
+        if let Err(cleanup_error) = remove_project_sync_snapshot(snapshot_path).await {
+            tracing::warn!(
+                job_id = %job_id,
+                error = %cleanup_error,
+                "project_sync.snapshot.cleanup_failed"
+            );
+        }
     }
 
     finish_project_sync_job(&state, job_id, ProjectSyncJobStatus::Completed, None).await?;
@@ -1728,16 +1930,38 @@ async fn run_project_sync_job_inner(state: Arc<AppState>, job_id: &str) -> ApiRe
 fn parse_project_sync_record(line: &str) -> ApiResult<ProjectSyncUploadRecord> {
     let record: ProjectSyncUploadRecord = serde_json::from_str(line)
         .map_err(|error| ApiError::BadRequest(format!("Invalid NDJSON record: {}", error)))?;
-    if record.path.is_empty() {
-        return Err(ApiError::BadRequest(
-            "project_sync record path cannot be empty".to_string(),
-        ));
+    match record.op {
+        ProjectSyncRecordOp::Upsert => {
+            let source_path = record.path.as_deref().ok_or_else(|| {
+                ApiError::BadRequest("project_sync upsert record path is required".to_string())
+            })?;
+            if source_path.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "project_sync upsert record path cannot be empty".to_string(),
+                ));
+            }
+            if record.content.is_none() {
+                return Err(ApiError::BadRequest(format!(
+                    "project_sync upsert record '{}' content is required",
+                    source_path
+                )));
+            }
+        }
+        ProjectSyncRecordOp::Delete => {
+            if record.relative_path.is_none() {
+                return Err(ApiError::BadRequest(
+                    "project_sync delete record relative_path is required".to_string(),
+                ));
+            }
+        }
     }
     Ok(record)
 }
 
-fn build_project_sync_metadata(record: &ProjectSyncUploadRecord) -> ApiResult<serde_json::Value> {
-    let mut object = match record.metadata.clone() {
+fn project_sync_metadata_object(
+    metadata: Option<serde_json::Value>,
+) -> ApiResult<serde_json::Map<String, serde_json::Value>> {
+    let object = match metadata {
         Some(serde_json::Value::Object(object)) => object,
         Some(_) => {
             return Err(ApiError::BadRequest(
@@ -1746,15 +1970,36 @@ fn build_project_sync_metadata(record: &ProjectSyncUploadRecord) -> ApiResult<se
         }
         None => serde_json::Map::new(),
     };
+    Ok(object)
+}
+
+fn build_project_sync_metadata(record: &ProjectSyncUpsertRecord) -> ApiResult<serde_json::Value> {
+    let mut object = project_sync_metadata_object(record.metadata.clone())?;
     object.insert(
         "source_path".to_string(),
-        serde_json::Value::String(record.path.clone()),
+        serde_json::Value::String(record.source_path.clone()),
+    );
+    object.insert(
+        "relative_path".to_string(),
+        serde_json::Value::String(record.relative_path.clone()),
     );
     if let Some(language) = &record.language {
         object.insert(
             "language".to_string(),
             serde_json::Value::String(language.clone()),
         );
+    }
+    if let Some(content_hash) = &record.content_hash {
+        object.insert(
+            "content_hash".to_string(),
+            serde_json::Value::String(content_hash.clone()),
+        );
+    }
+    if let Some(chunk_index) = record.chunk_index {
+        object.insert("chunk_index".to_string(), serde_json::json!(chunk_index));
+    }
+    if let Some(chunk_count) = record.chunk_count {
+        object.insert("chunk_count".to_string(), serde_json::json!(chunk_count));
     }
     object
         .entry("source".to_string())
@@ -1790,20 +2035,320 @@ async fn project_sync_cancellation_requested(state: &AppState, job_id: &str) -> 
     Ok(is_cancellation_requested(manifest.status))
 }
 
-async fn process_spool_batches_locked(
-    state: Arc<AppState>,
-    job_id: &str,
-    index_name: &str,
-    spool: &Path,
+fn project_file_entry_to_response(
+    entry: filtering::ProjectFileEntry,
+) -> ProjectSyncFileEntryResponse {
+    ProjectSyncFileEntryResponse {
+        relative_path: entry.relative_path,
+        content_hash: entry.content_hash,
+        language: entry.language,
+        chunk_count: entry.chunk_count,
+        updated_at_ms: entry.updated_at_ms,
+    }
+}
+
+fn validate_project_sync_file_check_items(files: &[ProjectSyncFileCheckItem]) -> ApiResult<()> {
+    let mut seen_paths = HashSet::new();
+    for file in files {
+        validate_project_sync_relative_path(&file.relative_path)?;
+        validate_project_sync_content_hash(&file.content_hash)?;
+        if !seen_paths.insert(file.relative_path.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "project_sync files/check contains duplicate relative_path '{}'",
+                file.relative_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_project_sync_relative_path(relative_path: &str) -> ApiResult<()> {
+    if relative_path.is_empty() {
+        return Err(ApiError::BadRequest(
+            "project_sync relative_path cannot be empty".to_string(),
+        ));
+    }
+    if relative_path.contains('\\') {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync relative_path '{}' must use forward slashes",
+            relative_path
+        )));
+    }
+    let path = Path::new(relative_path);
+    let components = path.components().collect::<Vec<Component<'_>>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync relative_path '{}' must be a safe project-relative path",
+            relative_path
+        )));
+    }
+    Ok(())
+}
+
+fn validate_project_sync_content_hash(content_hash: &str) -> ApiResult<()> {
+    let Some(hex) = content_hash.strip_prefix("sha256:") else {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync content_hash '{}' must start with 'sha256:'",
+            content_hash
+        )));
+    };
+    if hex.len() != 64 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync content_hash '{}' must contain 64 hexadecimal SHA-256 characters",
+            content_hash
+        )));
+    }
+    Ok(())
+}
+
+fn project_sync_metadata_string(
+    metadata: Option<&serde_json::Value>,
+    key: &str,
+) -> ApiResult<Option<String>> {
+    match metadata {
+        Some(serde_json::Value::Object(object)) => Ok(object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)),
+        Some(_) => Err(ApiError::BadRequest(
+            "project_sync record metadata must be a JSON object".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn resolve_project_sync_record_relative_path(
+    record: &ProjectSyncUploadRecord,
+    source_path: Option<&str>,
+) -> ApiResult<String> {
+    if let Some(relative_path) = &record.relative_path {
+        validate_project_sync_relative_path(relative_path)?;
+        return Ok(relative_path.clone());
+    }
+    if let Some(relative_path) =
+        project_sync_metadata_string(record.metadata.as_ref(), "relative_path")?
+    {
+        validate_project_sync_relative_path(&relative_path)?;
+        return Ok(relative_path);
+    }
+    let fallback_path = source_path.ok_or_else(|| {
+        ApiError::BadRequest("project_sync relative_path is required".to_string())
+    })?;
+    validate_project_sync_relative_path(fallback_path)?;
+    Ok(fallback_path.to_string())
+}
+
+fn resolve_project_sync_record_language(
+    record: &ProjectSyncUploadRecord,
+) -> ApiResult<Option<String>> {
+    match &record.language {
+        Some(language) => Ok(Some(language.clone())),
+        None => project_sync_metadata_string(record.metadata.as_ref(), "language"),
+    }
+}
+
+fn build_project_sync_upsert_record(
+    record: ProjectSyncUploadRecord,
+) -> ApiResult<ProjectSyncUpsertRecord> {
+    let source_path = record.path.clone().ok_or_else(|| {
+        ApiError::BadRequest("project_sync upsert record path is required".to_string())
+    })?;
+    let content = record.content.clone().ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "project_sync upsert record '{}' content is required",
+            source_path
+        ))
+    })?;
+    let relative_path = resolve_project_sync_record_relative_path(&record, Some(&source_path))?;
+    if let Some(content_hash) = &record.content_hash {
+        validate_project_sync_content_hash(content_hash)?;
+    }
+    if record.chunk_index == Some(0) {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync record '{}' chunk_index must be greater than 0",
+            source_path
+        )));
+    }
+    if record.chunk_count == Some(0) {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync record '{}' chunk_count must be greater than 0",
+            source_path
+        )));
+    }
+    if let (Some(chunk_index), Some(chunk_count)) = (record.chunk_index, record.chunk_count) {
+        if chunk_index > chunk_count {
+            return Err(ApiError::BadRequest(format!(
+                "project_sync record '{}' chunk_index {} exceeds chunk_count {}",
+                source_path, chunk_index, chunk_count
+            )));
+        }
+    }
+    let language = resolve_project_sync_record_language(&record)?;
+    Ok(ProjectSyncUpsertRecord {
+        source_path,
+        relative_path,
+        content,
+        language,
+        metadata: record.metadata,
+        content_hash: record.content_hash,
+        chunk_index: record.chunk_index,
+        chunk_count: record.chunk_count,
+    })
+}
+
+fn validate_project_sync_delete_record(record: &ProjectSyncUploadRecord) -> ApiResult<String> {
+    let relative_path = resolve_project_sync_record_relative_path(record, None)?;
+    if let Some(content_hash) = &record.content_hash {
+        validate_project_sync_content_hash(content_hash)?;
+    }
+    Ok(relative_path)
+}
+
+fn validate_project_sync_file_group(
+    relative_path: String,
+    mut records: Vec<ProjectSyncUpsertRecord>,
+) -> ApiResult<ProjectSyncUpsertFile> {
+    let mut content_hashes = records
+        .iter()
+        .filter_map(|record| record.content_hash.clone())
+        .collect::<Vec<String>>();
+    content_hashes.sort();
+    content_hashes.dedup();
+    if content_hashes.len() > 1 {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' has inconsistent content_hash values",
+            relative_path
+        )));
+    }
+    let content_hash = content_hashes.into_iter().next();
+    if content_hash.is_some()
+        && records
+            .iter()
+            .any(|record| record.content_hash.as_ref() != content_hash.as_ref())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' must include content_hash on every chunk",
+            relative_path
+        )));
+    }
+
+    let language = validate_project_sync_file_language(&relative_path, &records)?;
+    let chunk_count = validate_project_sync_file_chunk_count(&relative_path, &records)?;
+    sort_project_sync_file_records(&relative_path, chunk_count, &mut records)?;
+
+    Ok(ProjectSyncUpsertFile {
+        relative_path,
+        content_hash,
+        language,
+        chunk_count,
+        records,
+    })
+}
+
+fn validate_project_sync_file_language(
+    relative_path: &str,
+    records: &[ProjectSyncUpsertRecord],
+) -> ApiResult<String> {
+    let mut languages = records
+        .iter()
+        .filter_map(|record| record.language.clone())
+        .collect::<Vec<String>>();
+    languages.sort();
+    languages.dedup();
+    if languages.len() > 1 {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' has inconsistent language values",
+            relative_path
+        )));
+    }
+    Ok(languages
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "unknown".to_string()))
+}
+
+fn validate_project_sync_file_chunk_count(
+    relative_path: &str,
+    records: &[ProjectSyncUpsertRecord],
+) -> ApiResult<usize> {
+    let mut chunk_counts = records
+        .iter()
+        .filter_map(|record| record.chunk_count)
+        .collect::<Vec<usize>>();
+    chunk_counts.sort_unstable();
+    chunk_counts.dedup();
+    if chunk_counts.len() > 1 {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' has inconsistent chunk_count values",
+            relative_path
+        )));
+    }
+    let chunk_count = chunk_counts.into_iter().next().unwrap_or(records.len());
+    if chunk_count != records.len() {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' declared chunk_count {} but uploaded {} chunks",
+            relative_path,
+            chunk_count,
+            records.len()
+        )));
+    }
+    Ok(chunk_count)
+}
+
+fn sort_project_sync_file_records(
+    relative_path: &str,
+    chunk_count: usize,
+    records: &mut [ProjectSyncUpsertRecord],
 ) -> ApiResult<()> {
+    let has_chunk_index = records.iter().any(|record| record.chunk_index.is_some());
+    if !has_chunk_index {
+        return Ok(());
+    }
+    if records.iter().any(|record| record.chunk_index.is_none()) {
+        return Err(ApiError::BadRequest(format!(
+            "project_sync file '{}' must include chunk_index on every chunk",
+            relative_path
+        )));
+    }
+    let mut seen_indexes = HashSet::new();
+    for record in records.iter() {
+        let chunk_index = record.chunk_index.ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "project_sync file '{}' is missing chunk_index",
+                relative_path
+            ))
+        })?;
+        if chunk_index > chunk_count {
+            return Err(ApiError::BadRequest(format!(
+                "project_sync file '{}' chunk_index {} exceeds chunk_count {}",
+                relative_path, chunk_index, chunk_count
+            )));
+        }
+        if !seen_indexes.insert(chunk_index) {
+            return Err(ApiError::BadRequest(format!(
+                "project_sync file '{}' contains duplicate chunk_index {}",
+                relative_path, chunk_index
+            )));
+        }
+    }
+    records.sort_by_key(|record| record.chunk_index.unwrap_or(usize::MAX));
+    Ok(())
+}
+
+async fn collect_project_sync_plan(spool: &Path) -> ApiResult<ProjectSyncPlan> {
     let file = fs::File::open(spool)
         .await
         .map_err(|error| ApiError::Internal(format!("Failed to open spool file: {}", error)))?;
     let mut lines = BufReader::new(file).lines();
-    let batch_size = max_batch_documents();
-    let mut documents: Vec<String> = Vec::with_capacity(batch_size);
-    let mut metadata: Vec<serde_json::Value> = Vec::with_capacity(batch_size);
-    let mut processed_records: usize = 0;
+    let mut seen_source_paths = HashSet::new();
+    let mut grouped_records: HashMap<String, Vec<ProjectSyncUpsertRecord>> = HashMap::new();
+    let mut delete_paths = Vec::new();
+    let mut seen_delete_paths = HashSet::new();
+    let mut processed_records = 0usize;
 
     while let Some(line) = lines
         .next_line()
@@ -1814,33 +2359,213 @@ async fn process_spool_batches_locked(
             continue;
         }
         let record = parse_project_sync_record(&line)?;
-        let project_metadata = build_project_sync_metadata(&record)?;
-        documents.push(record.content);
-        metadata.push(project_metadata);
         processed_records += 1;
-
-        if documents.len() >= batch_size {
-            process_project_sync_batch_locked(
-                state.clone(),
-                job_id,
-                index_name,
-                documents,
-                metadata,
-            )
-            .await?;
-            documents = Vec::with_capacity(batch_size);
-            metadata = Vec::with_capacity(batch_size);
+        match record.op {
+            ProjectSyncRecordOp::Upsert => {
+                let upsert_record = build_project_sync_upsert_record(record)?;
+                if !seen_source_paths.insert(upsert_record.source_path.clone()) {
+                    return Err(ApiError::BadRequest(format!(
+                        "project_sync upload contains duplicate path '{}'",
+                        upsert_record.source_path
+                    )));
+                }
+                grouped_records
+                    .entry(upsert_record.relative_path.clone())
+                    .or_default()
+                    .push(upsert_record);
+            }
+            ProjectSyncRecordOp::Delete => {
+                let relative_path = validate_project_sync_delete_record(&record)?;
+                if seen_delete_paths.insert(relative_path.clone()) {
+                    delete_paths.push(relative_path);
+                }
+            }
         }
     }
 
-    if !documents.is_empty() {
-        process_project_sync_batch_locked(state, job_id, index_name, documents, metadata).await?;
-    }
     if processed_records == 0 {
         return Err(ApiError::BadRequest(
             "project_sync upload contains no records".to_string(),
         ));
     }
+
+    for relative_path in grouped_records.keys() {
+        if seen_delete_paths.contains(relative_path) {
+            return Err(ApiError::BadRequest(format!(
+                "project_sync upload cannot delete and upsert '{}' in the same job",
+                relative_path
+            )));
+        }
+    }
+
+    let mut upsert_files = Vec::with_capacity(grouped_records.len());
+    let mut grouped_pairs = grouped_records
+        .into_iter()
+        .collect::<Vec<(String, Vec<ProjectSyncUpsertRecord>)>>();
+    grouped_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    for (relative_path, records) in grouped_pairs {
+        upsert_files.push(validate_project_sync_file_group(relative_path, records)?);
+    }
+
+    Ok(ProjectSyncPlan {
+        upsert_files,
+        delete_relative_paths: delete_paths,
+        record_count: processed_records,
+    })
+}
+
+fn project_sync_manifest_config_matches(config: Option<filtering::ProjectManifestConfig>) -> bool {
+    matches!(
+        config,
+        Some(filtering::ProjectManifestConfig {
+            version: filtering::PROJECT_MANIFEST_VERSION,
+            chunker_version: PROJECT_SYNC_CHUNKER_VERSION,
+            max_lines_per_blob: PROJECT_SYNC_MAX_LINES_PER_BLOB,
+        })
+    )
+}
+
+fn build_project_sync_executable_plan(
+    index_path: &str,
+    plan: ProjectSyncPlan,
+) -> ApiResult<ProjectSyncExecutablePlan> {
+    if plan.upsert_files.is_empty() && plan.delete_relative_paths.is_empty() {
+        return Err(ApiError::BadRequest(
+            "project_sync upload contains no actionable records".to_string(),
+        ));
+    }
+    filtering::ensure_project_files(index_path).map_err(ApiError::NextPlaid)?;
+    let config = filtering::get_project_manifest_config(index_path).map_err(ApiError::NextPlaid)?;
+    let config_matches = project_sync_manifest_config_matches(config);
+    let hash_paths = plan
+        .upsert_files
+        .iter()
+        .filter(|file| file.content_hash.is_some())
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<String>>();
+    let existing_files =
+        filtering::get_project_files(index_path, &hash_paths).map_err(ApiError::NextPlaid)?;
+    let existing_by_path = existing_files
+        .into_iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<HashMap<String, filtering::ProjectFileEntry>>();
+
+    let mut changed_upsert_files = Vec::new();
+    let mut skipped_unchanged_files = Vec::new();
+    for file in plan.upsert_files {
+        let should_skip = match (
+            &file.content_hash,
+            existing_by_path.get(&file.relative_path),
+        ) {
+            (Some(content_hash), Some(existing_file)) => {
+                config_matches
+                    && existing_file.content_hash == *content_hash
+                    && existing_file.language == file.language
+                    && existing_file.chunk_count == file.chunk_count
+            }
+            _ => false,
+        };
+        if should_skip {
+            skipped_unchanged_files.push(file);
+        } else {
+            changed_upsert_files.push(file);
+        }
+    }
+
+    Ok(ProjectSyncExecutablePlan {
+        changed_upsert_files,
+        skipped_unchanged_files,
+        delete_relative_paths: plan.delete_relative_paths,
+    })
+}
+
+async fn process_project_sync_files_locked(
+    state: Arc<AppState>,
+    job_id: &str,
+    index_name: &str,
+    index_path: &str,
+    plan: ProjectSyncExecutablePlan,
+) -> ApiResult<()> {
+    let batch_size = max_batch_documents();
+    let mut documents: Vec<String> = Vec::with_capacity(batch_size);
+    let mut metadata: Vec<serde_json::Value> = Vec::with_capacity(batch_size);
+    let mut processed_records = 0usize;
+
+    for file in &plan.changed_upsert_files {
+        for record in &file.records {
+            let project_metadata = build_project_sync_metadata(record)?;
+            documents.push(record.content.clone());
+            metadata.push(project_metadata);
+            processed_records += 1;
+
+            if documents.len() >= batch_size {
+                process_project_sync_batch_locked(
+                    state.clone(),
+                    job_id,
+                    index_name,
+                    documents,
+                    metadata,
+                )
+                .await?;
+                documents = Vec::with_capacity(batch_size);
+                metadata = Vec::with_capacity(batch_size);
+            }
+        }
+    }
+
+    if !documents.is_empty() {
+        process_project_sync_batch_locked(state.clone(), job_id, index_name, documents, metadata)
+            .await?;
+    }
+
+    ensure_project_sync_job_not_cancelled(&state, job_id).await?;
+    update_project_sync_manifest_after_success(index_path, &plan)?;
+    tracing::info!(
+        index = %index_name,
+        changed_files = plan.changed_upsert_files.len(),
+        skipped_unchanged_files = plan.skipped_unchanged_files.len(),
+        deleted_files = plan.delete_relative_paths.len(),
+        processed_records = processed_records,
+        "project_sync.manifest.updated"
+    );
+    Ok(())
+}
+
+fn update_project_sync_manifest_after_success(
+    index_path: &str,
+    plan: &ProjectSyncExecutablePlan,
+) -> ApiResult<()> {
+    filtering::set_project_manifest_config(
+        index_path,
+        PROJECT_SYNC_CHUNKER_VERSION,
+        PROJECT_SYNC_MAX_LINES_PER_BLOB,
+    )
+    .map_err(ApiError::NextPlaid)?;
+    let now_ms = now_epoch_ms();
+    let manifest_entries = plan
+        .changed_upsert_files
+        .iter()
+        .filter_map(|file| {
+            file.content_hash
+                .as_ref()
+                .map(|content_hash| filtering::ProjectFileEntry {
+                    relative_path: file.relative_path.clone(),
+                    content_hash: content_hash.clone(),
+                    language: file.language.clone(),
+                    chunk_count: file.chunk_count,
+                    updated_at_ms: now_ms,
+                })
+        })
+        .collect::<Vec<filtering::ProjectFileEntry>>();
+    let unhashed_paths = plan
+        .changed_upsert_files
+        .iter()
+        .filter(|file| file.content_hash.is_none())
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<String>>();
+
+    filtering::delete_project_files(index_path, &unhashed_paths).map_err(ApiError::NextPlaid)?;
+    filtering::upsert_project_files(index_path, &manifest_entries).map_err(ApiError::NextPlaid)?;
     Ok(())
 }
 
@@ -1868,42 +2593,6 @@ async fn process_project_sync_batch_locked(
     .await
     .map_err(ApiError::Internal)?;
     Ok(())
-}
-
-async fn collect_project_sync_source_paths(spool: &Path) -> ApiResult<Vec<String>> {
-    let file = fs::File::open(spool)
-        .await
-        .map_err(|error| ApiError::Internal(format!("Failed to open spool file: {}", error)))?;
-    let mut lines = BufReader::new(file).lines();
-    let mut seen_paths: HashSet<String> = HashSet::new();
-    let mut source_paths: Vec<String> = Vec::new();
-    let mut processed_records: usize = 0;
-
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("Failed to read spool line: {}", error)))?
-    {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record = parse_project_sync_record(&line)?;
-        processed_records += 1;
-        if !seen_paths.insert(record.path.clone()) {
-            return Err(ApiError::BadRequest(format!(
-                "project_sync upload contains duplicate path '{}'",
-                record.path
-            )));
-        }
-        source_paths.push(record.path);
-    }
-
-    if processed_records == 0 {
-        return Err(ApiError::BadRequest(
-            "project_sync upload contains no records".to_string(),
-        ));
-    }
-    Ok(source_paths)
 }
 
 async fn create_project_sync_snapshot(
@@ -2071,18 +2760,18 @@ async fn mark_project_sync_dirty(
     Ok(())
 }
 
-async fn delete_existing_source_paths_after_repair_locked(
+async fn delete_existing_relative_paths_after_repair_locked(
     state: Arc<AppState>,
     index_name: &str,
-    source_paths: &[String],
+    relative_paths: &[String],
 ) -> ApiResult<usize> {
-    if source_paths.is_empty() {
+    if relative_paths.is_empty() {
         return Ok(0);
     }
 
     let path_str = state.index_path(index_name).to_string_lossy().to_string();
     let index_name_owned = index_name.to_string();
-    let paths: Vec<String> = source_paths.to_vec();
+    let paths: Vec<String> = relative_paths.to_vec();
     let state_clone = state.clone();
 
     task::spawn_blocking(move || -> Result<usize, String> {
@@ -2090,24 +2779,37 @@ async fn delete_existing_source_paths_after_repair_locked(
             return Ok(0);
         }
 
-        if !filtering::has_column(&path_str, "source_path")
-            .map_err(|error| format!("Failed to inspect source_path metadata column: {}", error))?
-        {
+        let has_relative_path =
+            filtering::has_column(&path_str, "relative_path").map_err(|error| {
+                format!("Failed to inspect relative_path metadata column: {}", error)
+            })?;
+        let has_source_path = filtering::has_column(&path_str, "source_path")
+            .map_err(|error| format!("Failed to inspect source_path metadata column: {}", error))?;
+        if !has_relative_path && !has_source_path {
             return Ok(0);
         }
 
-        let mut doc_ids: Vec<i64> = Vec::new();
-        for path_chunk in paths.chunks(500) {
-            let (condition, parameters) = build_source_path_condition(path_chunk);
-            match filtering::where_condition(&path_str, &condition, &parameters) {
-                Ok(mut chunk_ids) => doc_ids.append(&mut chunk_ids),
-                Err(error) => {
-                    return Err(format!(
-                        "Failed to find existing source_path documents: {}",
+        let mut doc_ids = if has_relative_path {
+            collect_document_ids_by_metadata_values(&path_str, "relative_path", &paths).map_err(
+                |error| format!("Failed to find existing relative_path documents: {}", error),
+            )?
+        } else {
+            Vec::new()
+        };
+        if has_source_path {
+            let mut source_path_doc_ids =
+                collect_document_ids_by_metadata_values(&path_str, "source_path", &paths).map_err(
+                    |error| format!("Failed to find existing source_path documents: {}", error),
+                )?;
+            let mut legacy_chunk_doc_ids =
+                collect_legacy_chunk_source_path_doc_ids(&path_str, &paths).map_err(|error| {
+                    format!(
+                        "Failed to find existing legacy chunk source_path documents: {}",
                         error
-                    ));
-                }
-            }
+                    )
+                })?;
+            doc_ids.append(&mut source_path_doc_ids);
+            doc_ids.append(&mut legacy_chunk_doc_ids);
         }
         doc_ids.sort_unstable();
         doc_ids.dedup();
@@ -2118,39 +2820,110 @@ async fn delete_existing_source_paths_after_repair_locked(
         let mut index = MmapIndex::load(&path_str)
             .map_err(|error| format!("Failed to load index: {}", error))?;
         let deleted = index.delete(&doc_ids).map_err(|error| {
-            format!("Failed to delete existing source_path documents: {}", error)
+            format!(
+                "Failed to delete existing project_sync documents: {}",
+                error
+            )
         })?;
         index.reload().map_err(|error| {
-            format!("Failed to reload index after source_path delete: {}", error)
+            format!(
+                "Failed to reload index after project_sync delete: {}",
+                error
+            )
         })?;
         state_clone
             .reload_index(&index_name_owned)
             .map_err(|error| {
-                format!("Failed to reload state after source_path delete: {}", error)
+                format!(
+                    "Failed to reload state after project_sync delete: {}",
+                    error
+                )
             })?;
         Ok(deleted)
     })
     .await
-    .map_err(|error| ApiError::Internal(format!("Source path delete task failed: {}", error)))?
+    .map_err(|error| ApiError::Internal(format!("Relative path delete task failed: {}", error)))?
     .map_err(ApiError::Internal)
 }
 
-fn build_source_path_condition(source_paths: &[String]) -> (String, Vec<serde_json::Value>) {
-    if source_paths.len() == 1 {
+fn collect_document_ids_by_metadata_values(
+    index_path: &str,
+    column: &str,
+    values: &[String],
+) -> Result<Vec<i64>, next_plaid::Error> {
+    let mut doc_ids = Vec::new();
+    for value_chunk in values.chunks(500) {
+        let (condition, parameters) = build_metadata_value_condition(column, value_chunk);
+        let mut chunk_ids = filtering::where_condition(index_path, &condition, &parameters)?;
+        doc_ids.append(&mut chunk_ids);
+    }
+    Ok(doc_ids)
+}
+
+fn collect_legacy_chunk_source_path_doc_ids(
+    index_path: &str,
+    relative_paths: &[String],
+) -> Result<Vec<i64>, next_plaid::Error> {
+    let mut doc_ids = Vec::new();
+    for path_chunk in relative_paths.chunks(100) {
+        let (condition, parameters) = build_legacy_chunk_source_path_condition(path_chunk);
+        let mut chunk_ids = filtering::where_condition_regexp(index_path, &condition, &parameters)?;
+        doc_ids.append(&mut chunk_ids);
+    }
+    Ok(doc_ids)
+}
+
+fn build_metadata_value_condition(
+    column: &str,
+    values: &[String],
+) -> (String, Vec<serde_json::Value>) {
+    if values.len() == 1 {
         return (
-            "\"source_path\" = ?".to_string(),
-            vec![serde_json::Value::String(source_paths[0].clone())],
+            format!("\"{}\" = ?", column),
+            vec![serde_json::Value::String(values[0].clone())],
         );
     }
 
-    let placeholders = std::iter::repeat_n("?", source_paths.len())
+    let placeholders = std::iter::repeat_n("?", values.len())
         .collect::<Vec<&str>>()
         .join(", ");
-    let parameters = source_paths
+    let parameters = values
         .iter()
-        .map(|path| serde_json::Value::String(path.clone()))
+        .map(|value| serde_json::Value::String(value.clone()))
         .collect::<Vec<serde_json::Value>>();
-    (format!("\"source_path\" IN ({})", placeholders), parameters)
+    (format!("\"{}\" IN ({})", column, placeholders), parameters)
+}
+
+fn build_legacy_chunk_source_path_condition(
+    relative_paths: &[String],
+) -> (String, Vec<serde_json::Value>) {
+    let condition = std::iter::repeat_n("\"source_path\" REGEXP ?", relative_paths.len())
+        .collect::<Vec<&str>>()
+        .join(" OR ");
+    let parameters = relative_paths
+        .iter()
+        .map(|relative_path| {
+            serde_json::Value::String(format!(
+                "^{}#chunk[0-9]+of[0-9]+$",
+                escape_project_sync_regex_literal(relative_path)
+            ))
+        })
+        .collect::<Vec<serde_json::Value>>();
+    (condition, parameters)
+}
+
+fn escape_project_sync_regex_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn copy_dir_recursive_blocking(source: &Path, destination: &Path) -> Result<(), String> {
@@ -2272,11 +3045,13 @@ mod tests {
     }
 
     #[test]
-    fn source_path_condition_uses_in_clause_for_multiple_paths() {
-        let (condition, parameters) =
-            build_source_path_condition(&["src/lib.rs".to_string(), "src/main.rs".to_string()]);
+    fn metadata_value_condition_uses_in_clause_for_multiple_values() {
+        let (condition, parameters) = build_metadata_value_condition(
+            "relative_path",
+            &["src/lib.rs".to_string(), "src/main.rs".to_string()],
+        );
 
-        assert_eq!(condition, "\"source_path\" IN (?, ?)");
+        assert_eq!(condition, "\"relative_path\" IN (?, ?)");
         assert_eq!(
             parameters,
             vec![
@@ -2287,7 +3062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_path_delete_skips_legacy_metadata_without_source_path() {
+    async fn relative_path_delete_skips_legacy_metadata_without_project_paths() {
         let temp_dir = TempDir::new().expect("temp dir should exist");
         let state = Arc::new(build_test_state(temp_dir.path().to_path_buf()));
         let index_path = state.index_path("idx");
@@ -2297,7 +3072,7 @@ mod tests {
         filtering::create(index_path_str, &[json!({"name": "src/lib.rs"})], &[0])
             .expect("legacy metadata should exist");
 
-        let deleted = delete_existing_source_paths_after_repair_locked(
+        let deleted = delete_existing_relative_paths_after_repair_locked(
             state,
             "idx",
             &["src/lib.rs".to_string()],

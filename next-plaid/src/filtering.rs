@@ -47,6 +47,31 @@ pub(crate) const METADATA_DB_NAME: &str = "metadata.db";
 /// Primary key column name (matches fast-plaid).
 pub(crate) const SUBSET_COLUMN: &str = "_subset_";
 
+const PROJECT_FILES_TABLE: &str = "project_files";
+const PROJECT_MANIFEST_CONFIG_TABLE: &str = "project_manifest_config";
+pub const PROJECT_MANIFEST_VERSION: u32 = 1;
+const PROJECT_MANIFEST_VERSION_KEY: &str = "version";
+const PROJECT_MANIFEST_CHUNKER_VERSION_KEY: &str = "chunker_version";
+const PROJECT_MANIFEST_MAX_LINES_PER_BLOB_KEY: &str = "max_lines_per_blob";
+
+/// File-level state stored for project_sync uploads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFileEntry {
+    pub relative_path: String,
+    pub content_hash: String,
+    pub language: String,
+    pub chunk_count: usize,
+    pub updated_at_ms: u64,
+}
+
+/// Project file manifest configuration stored beside project file rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectManifestConfig {
+    pub version: u32,
+    pub chunker_version: u32,
+    pub max_lines_per_blob: usize,
+}
+
 /// Validate that a column name is a safe SQL identifier.
 ///
 /// Column names must start with a letter or underscore, followed by
@@ -521,6 +546,335 @@ pub fn has_column(index_path: &str, column_name: &str) -> Result<bool> {
     Ok(columns.contains(column_name))
 }
 
+fn ensure_project_manifest_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_files (
+            relative_path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            language TEXT NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS project_manifest_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_project_files_content_hash
+            ON project_files(content_hash);",
+    )?;
+    Ok(())
+}
+
+fn set_project_manifest_config_value(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {} (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            PROJECT_MANIFEST_CONFIG_TABLE
+        ),
+        (key, value),
+    )?;
+    Ok(())
+}
+
+fn read_project_manifest_config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT value FROM {} WHERE key = ?1",
+        PROJECT_MANIFEST_CONFIG_TABLE
+    ))?;
+    let mut rows = stmt.query([key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_project_manifest_u32(value: Option<String>, key: &str) -> Result<Option<u32>> {
+    match value {
+        Some(value) => value.parse::<u32>().map(Some).map_err(|error| {
+            Error::Filtering(format!(
+                "Invalid project manifest config value for '{}': {}",
+                key, error
+            ))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_project_manifest_usize(value: Option<String>, key: &str) -> Result<Option<usize>> {
+    match value {
+        Some(value) => value.parse::<usize>().map(Some).map_err(|error| {
+            Error::Filtering(format!(
+                "Invalid project manifest config value for '{}': {}",
+                key, error
+            ))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn project_manifest_i64_to_usize(value: i64, column: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|error| {
+        Error::Filtering(format!(
+            "Invalid project manifest integer value for '{}': {}",
+            column, error
+        ))
+    })
+}
+
+fn project_manifest_i64_to_u64(value: i64, column: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        Error::Filtering(format!(
+            "Invalid project manifest integer value for '{}': {}",
+            column, error
+        ))
+    })
+}
+
+fn project_manifest_usize_to_i64(value: usize, column: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|error| {
+        Error::Filtering(format!(
+            "Project manifest integer value for '{}' is too large: {}",
+            column, error
+        ))
+    })
+}
+
+fn project_manifest_u64_to_i64(value: u64, column: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|error| {
+        Error::Filtering(format!(
+            "Project manifest integer value for '{}' is too large: {}",
+            column, error
+        ))
+    })
+}
+
+/// Ensure project file manifest tables exist for an index.
+pub fn ensure_project_files(index_path: &str) -> Result<()> {
+    let index_dir = Path::new(index_path);
+    if !index_dir.exists() {
+        fs::create_dir_all(index_dir)?;
+    }
+    let db_path = get_db_path(index_path);
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)
+}
+
+/// Store project manifest configuration.
+pub fn set_project_manifest_config(
+    index_path: &str,
+    chunker_version: u32,
+    max_lines_per_blob: usize,
+) -> Result<()> {
+    let db_path = get_db_path(index_path);
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    set_project_manifest_config_value(
+        &conn,
+        PROJECT_MANIFEST_VERSION_KEY,
+        &PROJECT_MANIFEST_VERSION.to_string(),
+    )?;
+    set_project_manifest_config_value(
+        &conn,
+        PROJECT_MANIFEST_CHUNKER_VERSION_KEY,
+        &chunker_version.to_string(),
+    )?;
+    set_project_manifest_config_value(
+        &conn,
+        PROJECT_MANIFEST_MAX_LINES_PER_BLOB_KEY,
+        &max_lines_per_blob.to_string(),
+    )?;
+    Ok(())
+}
+
+/// Read project manifest configuration if it exists.
+pub fn get_project_manifest_config(index_path: &str) -> Result<Option<ProjectManifestConfig>> {
+    let db_path = get_db_path(index_path);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    let version = parse_project_manifest_u32(
+        read_project_manifest_config_value(&conn, PROJECT_MANIFEST_VERSION_KEY)?,
+        PROJECT_MANIFEST_VERSION_KEY,
+    )?;
+    let chunker_version = parse_project_manifest_u32(
+        read_project_manifest_config_value(&conn, PROJECT_MANIFEST_CHUNKER_VERSION_KEY)?,
+        PROJECT_MANIFEST_CHUNKER_VERSION_KEY,
+    )?;
+    let max_lines_per_blob = parse_project_manifest_usize(
+        read_project_manifest_config_value(&conn, PROJECT_MANIFEST_MAX_LINES_PER_BLOB_KEY)?,
+        PROJECT_MANIFEST_MAX_LINES_PER_BLOB_KEY,
+    )?;
+    match (version, chunker_version, max_lines_per_blob) {
+        (Some(version), Some(chunker_version), Some(max_lines_per_blob)) => {
+            Ok(Some(ProjectManifestConfig {
+                version,
+                chunker_version,
+                max_lines_per_blob,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Read all project file manifest rows.
+pub fn list_project_files(index_path: &str) -> Result<Vec<ProjectFileEntry>> {
+    let db_path = get_db_path(index_path);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT relative_path, content_hash, language, chunk_count, updated_at_ms
+         FROM {}
+         ORDER BY relative_path",
+        PROJECT_FILES_TABLE
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (relative_path, content_hash, language, chunk_count, updated_at_ms) = row?;
+        entries.push(ProjectFileEntry {
+            relative_path,
+            content_hash,
+            language,
+            chunk_count: project_manifest_i64_to_usize(chunk_count, "chunk_count")?,
+            updated_at_ms: project_manifest_i64_to_u64(updated_at_ms, "updated_at_ms")?,
+        });
+    }
+    Ok(entries)
+}
+
+/// Read selected project file manifest rows by relative path.
+pub fn get_project_files(
+    index_path: &str,
+    relative_paths: &[String],
+) -> Result<Vec<ProjectFileEntry>> {
+    if relative_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db_path = get_db_path(index_path);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    let mut entries = Vec::new();
+    for path_chunk in relative_paths.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", path_chunk.len())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        let query = format!(
+            "SELECT relative_path, content_hash, language, chunk_count, updated_at_ms
+             FROM {}
+             WHERE relative_path IN ({})
+             ORDER BY relative_path",
+            PROJECT_FILES_TABLE, placeholders
+        );
+        let params = path_chunk
+            .iter()
+            .map(|path| path as &dyn ToSql)
+            .collect::<Vec<&dyn ToSql>>();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (relative_path, content_hash, language, chunk_count, updated_at_ms) = row?;
+            entries.push(ProjectFileEntry {
+                relative_path,
+                content_hash,
+                language,
+                chunk_count: project_manifest_i64_to_usize(chunk_count, "chunk_count")?,
+                updated_at_ms: project_manifest_i64_to_u64(updated_at_ms, "updated_at_ms")?,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Upsert project file manifest rows.
+pub fn upsert_project_files(index_path: &str, entries: &[ProjectFileEntry]) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let db_path = get_db_path(index_path);
+    let mut conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    let txn = conn.transaction()?;
+    {
+        let mut stmt = txn.prepare_cached(&format!(
+            "INSERT INTO {} (relative_path, content_hash, language, chunk_count, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(relative_path) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                language = excluded.language,
+                chunk_count = excluded.chunk_count,
+                updated_at_ms = excluded.updated_at_ms",
+            PROJECT_FILES_TABLE
+        ))?;
+        for entry in entries {
+            let chunk_count = project_manifest_usize_to_i64(entry.chunk_count, "chunk_count")?;
+            let updated_at_ms = project_manifest_u64_to_i64(entry.updated_at_ms, "updated_at_ms")?;
+            stmt.execute((
+                &entry.relative_path,
+                &entry.content_hash,
+                &entry.language,
+                chunk_count,
+                updated_at_ms,
+            ))?;
+        }
+    }
+    txn.commit()?;
+    Ok(entries.len())
+}
+
+/// Delete project file manifest rows.
+pub fn delete_project_files(index_path: &str, relative_paths: &[String]) -> Result<usize> {
+    if relative_paths.is_empty() {
+        return Ok(0);
+    }
+    let db_path = get_db_path(index_path);
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = open_db(&db_path)?;
+    ensure_project_manifest_tables(&conn)?;
+    let mut deleted = 0usize;
+    for path_chunk in relative_paths.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", path_chunk.len())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        let query = format!(
+            "DELETE FROM {} WHERE relative_path IN ({})",
+            PROJECT_FILES_TABLE, placeholders
+        );
+        let params = path_chunk
+            .iter()
+            .map(|path| path as &dyn ToSql)
+            .collect::<Vec<&dyn ToSql>>();
+        deleted += conn.execute(&query, params_from_iter(params))?;
+    }
+    Ok(deleted)
+}
+
 /// Validate a SQL WHERE condition against the allowed grammar and schema.
 ///
 /// This function performs security validation on user-provided SQL conditions:
@@ -730,7 +1084,23 @@ fn try_fixed_schema_from_first_row(
 
 /// Check if a metadata database exists for the given index.
 pub fn exists(index_path: &str) -> bool {
-    get_db_path(index_path).exists()
+    let db_path = get_db_path(index_path);
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = open_db(&db_path) else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'METADATA'
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .unwrap_or(false)
 }
 
 fn create_with_fixed_columns(
@@ -1638,7 +2008,7 @@ pub fn update_where(
 /// Get the number of documents in the metadata database.
 pub fn count(index_path: &str) -> Result<usize> {
     let db_path = get_db_path(index_path);
-    if !db_path.exists() {
+    if !exists(index_path) {
         return Ok(0);
     }
 
