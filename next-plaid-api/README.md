@@ -805,6 +805,19 @@ Rate limiting is **optional and disabled by default**. Enable it by setting `RAT
 
 ## Environment Variables
 
+### Indexing
+
+| Variable                          | Default | Description                                                                 |
+| --------------------------------- | ------- | --------------------------------------------------------------------------- |
+| `INDEX_DEFAULT_START_FROM_SCRATCH` | `999`   | Default `start_from_scratch` threshold for new indexes (see below)          |
+
+When an index update runs, indexes holding **fewer** documents than `start_from_scratch`
+are rebuilt from scratch (higher quality centroids) instead of updated incrementally;
+larger indexes are updated incrementally (faster). This env var sets the **default**
+threshold applied when an index is created without an explicit `config.start_from_scratch`.
+A per-index value supplied at creation time always takes precedence. The value is read once
+at startup.
+
 ### Rate Limiting & Concurrency
 
 | Variable                | Default | Description                                            |
